@@ -53,6 +53,20 @@ int main(int argc, char *argv[]) {
 
         int updates_ok = 0, updates_rej = 0;
 
+        /* ---- diagnostics (passive: reads state, never changes it) ----
+         * Optional 4th argument selects the CSV path. Default "diag.csv".
+         * Every value written below is already computed by the run; nothing
+         * here feeds back into the estimator.
+         */
+        const char *diag_path = (argc >= 5) ? argv[4] : "diag.csv";
+        FILE *diag = fopen(diag_path, "w");
+        if (diag)
+                fprintf(diag, "t,frame,pos_err,sigma_1d,sigma_3d,ratio_1d,ratio_3d,"
+                              "att_err_deg,n_live,n_dead,n_sub,n_skip,nobs_sum,nobs_max,"
+                              "nobs_all_max,skip_min,skip_max,n_clones,ok,rej,ok_frac\n");
+        else
+                fprintf(stderr, "warning: cannot open %s — diagnostics disabled\n", diag_path);
+
         printf("%-8s %-12s %-12s %-10s\n", "t [s]", "pos err [m]", "pred +- [m]", "att err [deg]");
 
         for (size_t k = i0; k < n-1; k++) {
@@ -63,20 +77,65 @@ int main(int argc, char *argv[]) {
                         snprintf(path, sizeof path, "%s/data/%s", cam_dir, cam[ic].filename);
                         image_t img;
                         if (image_load(path, &img) == 0) {
+                                int f_ok = 0, f_rej = 0, f_sub = 0, f_skip = 0;
+                                int nobs_sum = 0, nobs_max = 0;
+                                int all_max = 0;          /* longest track offered this frame */
+                                int skip_min = 0, skip_max = 0;  /* length range of skipped tracks */
+
                                 eskf_augment(&f, cam[ic].timestamp);
                                 frontend_process(&fe, &img);
 
                                 for (int d = 0; d < fe.n_dead; d++) {
                                         dead_track_t *tk = &fe.dead[d];
                                         int kk = tk->nobs;
-                                        if (kk > f.n_clones) continue;
+                                        if (kk > all_max) all_max = kk;
+                                        if (kk > f.n_clones) {
+                                                if (f_skip == 0 || kk < skip_min) skip_min = kk;
+                                                if (kk > skip_max) skip_max = kk;
+                                                f_skip++;
+                                                continue;
+                                        }
                                         int ci[FE_HIST];
                                         for (int j = 0; j < kk; j++)
                                                 ci[j] = f.n_clones - kk + j;
-                                        if (msckf_update_track(&f, ci, tk->obs, kk, 3.0/458.0))
+                                        f_sub++;
+                                        nobs_sum += kk;
+                                        if (kk > nobs_max) nobs_max = kk;
+                                        if (msckf_update_track(&f, ci, tk->obs, kk, 3.0/458.0)) {
                                                 updates_ok++;
-                                        else
+                                                f_ok++;
+                                        } else {
                                                 updates_rej++;
+                                                f_rej++;
+                                        }
+                                }
+
+                                if (diag) {
+                                        gt_sample_t *gd = &gt[gt_nearest(gt, m, cam[ic].timestamp)];
+                                        double dx = f.pos.x - gd->pos.x;
+                                        double dy = f.pos.y - gd->pos.y;
+                                        double dz = f.pos.z - gd->pos.z;
+                                        double err = sqrt(dx*dx + dy*dy + dz*dz);
+                                        double s1 = sqrt(mat_get(f.P, 0, 0));
+                                        double s3 = sqrt(mat_get(f.P, 0, 0) +
+                                                         mat_get(f.P, 1, 1) +
+                                                         mat_get(f.P, 2, 2));
+                                        double dot = f.q.w*gd->q.w + f.q.x*gd->q.x +
+                                                     f.q.y*gd->q.y + f.q.z*gd->q.z;
+                                        int nsub = f_ok + f_rej;
+                                        fprintf(diag,
+                                                "%.6f,%zu,%.4f,%.6f,%.6f,%.4f,%.4f,%.4f,"
+                                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f\n",
+                                                cam[ic].timestamp - imu[i0].timestamp, ic,
+                                                err, s1, s3,
+                                                (s1 > 0.0) ? err / s1 : 0.0,
+                                                (s3 > 0.0) ? err / s3 : 0.0,
+                                                2.0 * acos(fabs(dot)) * 180.0 / M_PI,
+                                                fe.n, fe.n_dead, f_sub, f_skip,
+                                                nobs_sum, nobs_max,
+                                                all_max, skip_min, skip_max, f.n_clones,
+                                                f_ok, f_rej,
+                                                (nsub > 0) ? (double)f_ok / (double)nsub : 0.0);
                                 }
                                 image_free(&img);
                         }
@@ -106,6 +165,7 @@ int main(int argc, char *argv[]) {
                f.bg.x, f.bg.y, f.bg.z,
                gt[m-1].gyro_bias.x, gt[m-1].gyro_bias.y, gt[m-1].gyro_bias.z);
 
+        if (diag) fclose(diag);
         frontend_free(&fe);
         free(imu);
         free(gt);
