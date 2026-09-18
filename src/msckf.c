@@ -1,12 +1,26 @@
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "msckf.h"
 #include "cam.h"
 #include "tri.h"
 
-static const double CHI2_95[17] = {
+/* Upper-tail chi-squared quantiles: entry [d-1] is exceeded with probability
+ * 0.01 by a chi-squared variable with d degrees of freedom. Named CHI2_95
+ * until 2026-09-18 — the name was wrong, the values were always the 99%
+ * quantiles, so the designed false-rejection rate was 1%, not 5%. Measured on
+ * MH_01: 0.4-2.1% of healthy tracks were rejected, which matches 1% and
+ * confirms the values.
+ *
+ * Now used as the Huber knee rather than as a hard rejection threshold. */
+static const double CHI2_99[17] = {
         6.635, 9.210, 11.345, 13.277, 15.086, 16.812, 18.475, 20.090, 21.666,
         23.209, 24.725, 26.217, 27.688, 29.141, 30.578, 32.000, 33.409,
 };
+
+int msckf_rej_count[MSCKF_REJ_COUNT];
+int msckf_invalid_obs;
+int msckf_valid_obs;
 
 extern mat_t quat_to_R(quaternion_t q);
 extern mat_t mat_skew(vector_3d_t v);
@@ -31,6 +45,7 @@ obs_jac_t obs_jacobian(const clone_t *cl, vector_3d_t pf) {
         double x = Rcw.d[0]*d.x + Rcw.d[1]*d.y + Rcw.d[2]*d.z;
         double y = Rcw.d[3]*d.x + Rcw.d[4]*d.y + Rcw.d[5]*d.z;
         double z = Rcw.d[6]*d.x + Rcw.d[7]*d.y + Rcw.d[8]*d.z;
+        o.depth = z;
         if (z <= 0.1) return o;
 
         o.z.x = x / z;
@@ -120,22 +135,34 @@ mat_t msckf_nullspace(mat_t Hf) {
         return A;
 }
 
-int msckf_update_track(eskf_t *f, const int *ci, const pt2_t *obs, int k, double sigma) {
-        if (k < 2 || 2*k > 40) return 0;
+int msckf_update_track(eskf_t *f, const int *ci, const pt2_t *obs, int k, double sigma, double *w_out) {
+        /* Weight actually applied to this track: 1.0 when the residual is
+         * inside the knee. Reported as 1.0 on every early return so the caller
+         * never reads a stale value. */
+        if (w_out) *w_out = 1.0;
+        if (k < 2 || 2*k > 40) { msckf_rej_count[MSCKF_REJ_K_RANGE]++; return 0; }
         size_t n = 15 + 6 * (size_t)f->n_clones;
 
         clone_t cl[MAX_CLONES];
         for (int i = 0; i < k; i++) cl[i] = f->clones[ci[i]];
 
         vector_3d_t pf;
-        if (!triangulate(cl, obs, k, &pf)) return 0;
+        if (!triangulate(cl, obs, k, &pf)) { msckf_rej_count[MSCKF_REJ_TRIANG]++; return 0; }
 
         mat_t r  = mat_zero(2*k, 1);
         mat_t Hx = mat_zero(2*k, n);
         mat_t Hf = mat_zero(2*k, 3);
+        int n_invalid = 0;
         for (int i = 0; i < k; i++) {
                 obs_jac_t o = obs_jacobian(&f->clones[ci[i]], pf);
-                if (!o.valid) return 0;
+                if (!o.valid) {
+                        /* Diagnostic only: keep scanning so the counters can
+                         * say how many observations of this track were
+                         * unusable. The track is still discarded exactly as
+                         * before — row i is simply left at zero. */
+                        n_invalid++;
+                        continue;
+                }
                 r.d[2*i]   = obs[i].x - o.z.x;
                 r.d[2*i+1] = obs[i].y - o.z.y;
                 size_t d = 15 + 6 * (size_t)ci[i];
@@ -146,25 +173,84 @@ int msckf_update_track(eskf_t *f, const int *ci, const pt2_t *obs, int k, double
                                 mat_set(&Hf, 2*i+rr, cc,     o.Hf[rr*3+cc]);
                         }
         }
+        if (n_invalid) {
+                msckf_rej_count[MSCKF_REJ_JACOBIAN]++;
+                msckf_invalid_obs += n_invalid;
+                msckf_valid_obs   += k - n_invalid;
+                /* MSCKF_DUMP=<n> prints the observations and clone positions of
+                 * the first n tracks discarded this way, then stops. Diagnostic
+                 * only; unset means no cost beyond one getenv. */
+                static int dump_left = -1;
+                if (dump_left < 0) {
+                        const char *e = getenv("MSCKF_DUMP");
+                        dump_left = e ? atoi(e) : 0;
+                }
+                if (dump_left > 0) {
+                        dump_left--;
+                        fprintf(stderr, "REJ k=%d pf=(%.5f %.5f %.5f) invalid=%d\n",
+                                k, pf.x, pf.y, pf.z, n_invalid);
+                        for (int i = 0; i < k; i++) {
+                                obs_jac_t od = obs_jacobian(&f->clones[ci[i]], pf);
+                                fprintf(stderr, "   obs[%d]=(%.6f %.6f) z=%+.6f clone%d=(%.5f %.5f %.5f)\n",
+                                        i, obs[i].x, obs[i].y, od.depth, ci[i],
+                                        f->clones[ci[i]].pos.x, f->clones[ci[i]].pos.y,
+                                        f->clones[ci[i]].pos.z);
+                        }
+                }
+                return 0;
+        }
 
         mat_t A = msckf_nullspace(Hf);
         size_t m = A.rows;
-        if (m == 0 || m > 17) return 0;
+        if (m == 0 || m > 17) { msckf_rej_count[MSCKF_REJ_NULLSPACE]++; return 0; }
         mat_t rp = mat_mul(A, r);
         mat_t Hp = mat_mul(A, Hx);
 
         mat_t S = mat_mul(mat_mul(Hp, f->P), mat_transpose(Hp));
+        double s2 = sigma * sigma;
         for (size_t i = 0; i < m; i++)
-                mat_set(&S, i, i, mat_get(S, i, i) + sigma * sigma);
+                mat_set(&S, i, i, mat_get(S, i, i) + s2);
 
         mat_t y;
-        if (!mat_chol_solve(S, rp, &y)) return 0;
+        if (!mat_chol_solve(S, rp, &y)) { msckf_rej_count[MSCKF_REJ_CHOL_Y]++; return 0; }
         double gamma = 0;
         for (size_t i = 0; i < m; i++) gamma += rp.d[i] * y.d[i];
-        if (gamma > CHI2_95[m-1]) return 0;
+
+        /* Robust (Huber) weighting replaces the hard chi-squared gate.
+         *
+         * A binary gate assumes the model is right. When it is not — the pose
+         * has drifted, so the reprojection residual grows — the gate rejects
+         * the very measurements that would correct the drift, and the error
+         * grows further. Measured on MH_01: 85-90% of submitted tracks were
+         * rejected for 25 s while the track population stayed identical to the
+         * healthy phases.
+         *
+         * So do not reject on residual size; down-weight instead, scaling the
+         * measurement noise up by 1/w with
+         *
+         *     w = sqrt(knee / gamma)   for gamma > knee,   else 1
+         *
+         * the Huber influence function generalised to the Mahalanobis distance
+         * sqrt(gamma). The knee is the quantile the old gate used, so every
+         * track that passed before is bit-identical.
+         *
+         * Influence is bounded: as gamma grows, w -> 0, the s2/w diagonal
+         * dominates S, S^-1 -> 0 and the correction dx -> 0. No second hard
+         * threshold is needed.
+         *
+         * Only the diagonal changes. Entry i of S is s0_i + s2, so
+         * s0_i = S_ii - s2 and the weighted entry is s0_i + s2/w. */
+        double w = 1.0;
+        double knee = CHI2_99[m-1];
+        if (gamma > knee) {
+                w = sqrt(knee / gamma);
+                for (size_t i = 0; i < m; i++)
+                        mat_set(&S, i, i, mat_get(S, i, i) - s2 + s2 / w);
+        }
+        if (w_out) *w_out = w;
 
         mat_t Sinv;
-        if (!mat_chol_solve(S, mat_eye(m), &Sinv)) return 0;
+        if (!mat_chol_solve(S, mat_eye(m), &Sinv)) { msckf_rej_count[MSCKF_REJ_CHOL_INV]++; return 0; }
         mat_t PHt = mat_mul(f->P, mat_transpose(Hp));
         mat_t K   = mat_mul(PHt, Sinv);
         mat_t dx  = mat_mul(K, rp);

@@ -59,25 +59,43 @@ int main(int argc, char *argv[]) {
          * here feeds back into the estimator.
          */
         const char *diag_path = (argc >= 5) ? argv[4] : "diag.csv";
+        /* Optional 5th argument: stop after this many seconds of sequence.
+         * Diagnostic-only. Window 1 lives at t = 20-45 s, so a 50 s run answers
+         * most questions in a quarter of the time. The estimator path is
+         * untouched; the same frames produce the same numbers. */
+        double t_end = (argc >= 6) ? atof(argv[5]) : 0.0;
+        int stop = 0;
         FILE *diag = fopen(diag_path, "w");
         if (diag)
                 fprintf(diag, "t,frame,pos_err,sigma_1d,sigma_3d,ratio_1d,ratio_3d,"
                               "att_err_deg,n_live,n_dead,n_sub,n_trunc,nobs_sum,nobs_max,"
-                              "nobs_all_max,trunc_min,trunc_max,n_clones,ok,rej,ok_frac\n");
+                              "nobs_all_max,trunc_min,trunc_max,n_clones,ok,rej,ok_frac,n_wtd,w_min,"
+                              "r_k,r_tri,r_jac,r_null,r_chy,r_chi,iobs,vobs\n");
         else
                 fprintf(stderr, "warning: cannot open %s — diagnostics disabled\n", diag_path);
 
         printf("%-8s %-12s %-12s %-10s\n", "t [s]", "pos err [m]", "pred +- [m]", "att err [deg]");
 
-        for (size_t k = i0; k < n-1; k++) {
+        for (size_t k = i0; k < n-1 && !stop; k++) {
                 double dt = imu[k+1].timestamp - imu[k].timestamp;
                 eskf_predict(&f, imu[k], dt);
 
                 if (ic < ncam && cam[ic].timestamp <= imu[k+1].timestamp) {
+                        if (t_end > 0.0 && cam[ic].timestamp - imu[i0].timestamp > t_end) {
+                                stop = 1;
+                                break;
+                        }
                         snprintf(path, sizeof path, "%s/data/%s", cam_dir, cam[ic].filename);
                         image_t img;
                         if (image_load(path, &img) == 0) {
                                 int f_ok = 0, f_rej = 0, f_sub = 0, f_trunc = 0;
+                                int n_wtd = 0;      /* tracks down-weighted this frame */
+                                double w_min = 1.0; /* worst weight applied this frame */
+                                int rej_before[MSCKF_REJ_COUNT];
+                                for (int r = 0; r < MSCKF_REJ_COUNT; r++)
+                                        rej_before[r] = msckf_rej_count[r];
+                                int iobs_before = msckf_invalid_obs;
+                                int vobs_before = msckf_valid_obs;
                                 int nobs_sum = 0, nobs_max = 0;
                                 int all_max = 0;         /* longest track offered this frame */
                                 int trunc_min = 0, trunc_max = 0;  /* length range of truncated tracks */
@@ -120,12 +138,17 @@ int main(int argc, char *argv[]) {
                                         f_sub++;
                                         nobs_sum += ks;
                                         if (ks > nobs_max) nobs_max = ks;
-                                        if (msckf_update_track(&f, ci, tk->obs + off, ks, 3.0/458.0)) {
+                                        double w = 1.0;
+                                        if (msckf_update_track(&f, ci, tk->obs + off, ks, 3.0/458.0, &w)) {
                                                 updates_ok++;
                                                 f_ok++;
                                         } else {
                                                 updates_rej++;
                                                 f_rej++;
+                                        }
+                                        if (w < 1.0) {
+                                                n_wtd++;
+                                                if (w < w_min) w_min = w;
                                         }
                                 }
 
@@ -144,7 +167,7 @@ int main(int argc, char *argv[]) {
                                         int nsub = f_ok + f_rej;
                                         fprintf(diag,
                                                 "%.6f,%zu,%.4f,%.6f,%.6f,%.4f,%.4f,%.4f,"
-                                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f\n",
+                                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d,%.4f,%d,%d,%d,%d,%d,%d,%d,%d\n",
                                                 cam[ic].timestamp - imu[i0].timestamp, ic,
                                                 err, s1, s3,
                                                 (s1 > 0.0) ? err / s1 : 0.0,
@@ -154,7 +177,16 @@ int main(int argc, char *argv[]) {
                                                 nobs_sum, nobs_max,
                                                 all_max, trunc_min, trunc_max, f.n_clones,
                                                 f_ok, f_rej,
-                                                (nsub > 0) ? (double)f_ok / (double)nsub : 0.0);
+                                                (nsub > 0) ? (double)f_ok / (double)nsub : 0.0,
+                                                n_wtd, w_min,
+                                                msckf_rej_count[0] - rej_before[0],
+                                                msckf_rej_count[1] - rej_before[1],
+                                                msckf_rej_count[2] - rej_before[2],
+                                                msckf_rej_count[3] - rej_before[3],
+                                                msckf_rej_count[4] - rej_before[4],
+                                                msckf_rej_count[5] - rej_before[5],
+                                                msckf_invalid_obs - iobs_before,
+                                                msckf_valid_obs - vobs_before);
                                 }
                                 image_free(&img);
                         }
