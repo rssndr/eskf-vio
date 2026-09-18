@@ -1,3 +1,4 @@
+#include <math.h>
 #include "eskf.h"
 #include "ins.h"
 
@@ -133,6 +134,86 @@ void eskf_inject(eskf_t *f, const mat_t *dx) {
                 vector_3d_t cth = { dx->d[d+3], dx->d[d+4], dx->d[d+5] };
                 f->clones[c].q = q_norm(q_mul_q(f->clones[c].q, gyro_to_q(cth, 1.0)));
         }
+}
+
+/* Accelerometer as a gravity-direction measurement. At rest the specific force
+ * is -g expressed in the body frame, so the predicted measurement is 9.81 * R'
+ * e_z. Gated on | |a| - g | < gate, because under real acceleration the
+ * accelerometer is not measuring gravity. Returns 1 if the update was applied. */
+int eskf_update_gravity(eskf_t *f, vector_3d_t a_m, double gate, double sigma_a) {
+        double am = sqrt(a_m.x*a_m.x + a_m.y*a_m.y + a_m.z*a_m.z);
+        if (gate <= 0.0 || fabs(am - 9.81) > gate)
+                return 0;
+
+        size_t n = 15 + 6 * (size_t)f->n_clones, st = f->P.cols;
+        mat_t R = quat_to_R(f->q);
+        double v[3] = { 9.81 * mat_get(R, 2, 0),
+                        9.81 * mat_get(R, 2, 1),
+                        9.81 * mat_get(R, 2, 2) };
+        double sk[9] = {  0.0, -v[2],  v[1],
+                        v[2],   0.0, -v[0],
+                       -v[1],  v[0],   0.0 };
+
+        static double H[3*MAT_MAX], PHt[MAT_MAX*3], tmp[MAT_MAX*MAT_MAX];
+        for (size_t j = 0; j < n; j++) {
+                H[0*n+j] = H[1*n+j] = H[2*n+j] = 0.0;
+        }
+        for (size_t i = 0; i < 3; i++) {
+                for (size_t j = 0; j < 3; j++)
+                        H[i*n + TH + j] = -sk[3*i+j];
+                H[i*n + BA + i] = -1.0;
+        }
+
+        double y[3] = { a_m.x - f->ba.x - v[0],
+                        a_m.y - f->ba.y - v[1],
+                        a_m.z - f->ba.z - v[2] };
+
+        for (size_t i = 0; i < n; i++)
+                for (size_t j = 0; j < 3; j++) {
+                        double s = 0.0;
+                        for (size_t k = 0; k < n; k++)
+                                s += f->P.d[i*st+k] * H[j*n+k];
+                        PHt[i*3+j] = s;
+                }
+
+        mat_t S = mat_zero(3, 3);
+        for (size_t i = 0; i < 3; i++)
+                for (size_t j = 0; j < 3; j++) {
+                        double s = 0.0;
+                        for (size_t k = 0; k < n; k++)
+                                s += H[i*n+k] * PHt[k*3+j];
+                        S.d[i*3+j] = s + (i == j ? sigma_a*sigma_a : 0.0);
+                }
+        mat_t Si = mat3_inv(S);
+
+        for (size_t i = 0; i < n; i++)
+                for (size_t j = 0; j < n; j++) {
+                        double s = 0.0;
+                        for (size_t k = 0; k < 3; k++) {
+                                double Kik = 0.0;
+                                for (size_t m = 0; m < 3; m++)
+                                        Kik += PHt[i*3+m] * Si.d[m*3+k];
+                                s += Kik * PHt[j*3+k];
+                        }
+                        tmp[i*n+j] = f->P.d[i*st+j] - s;
+                }
+        for (size_t i = 0; i < n; i++)
+                for (size_t j = 0; j < n; j++)
+                        f->P.d[i*st+j] = tmp[i*n+j];
+
+        mat_t dx = mat_zero(n, 1);
+        for (size_t i = 0; i < n; i++) {
+                double s = 0.0;
+                for (size_t j = 0; j < 3; j++) {
+                        double Kij = 0.0;
+                        for (size_t m = 0; m < 3; m++)
+                                Kij += PHt[i*3+m] * Si.d[m*3+j];
+                        s += Kij * y[j];
+                }
+                dx.d[i] = s;
+        }
+        eskf_inject(f, &dx);
+        return 1;
 }
 
 void eskf_update_pos(eskf_t *f, vector_3d_t z, double sigma_z) {

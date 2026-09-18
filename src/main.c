@@ -88,6 +88,74 @@ static double dir_var(const eskf_t *f, const double *n) {
         return v;
 }
 
+/* World-frame attitude error vector: R_true = exp(dth) * R_filter. */
+static void att_err_vec(const quaternion_t *qf, const quaternion_t *qt, double dth[3]) {
+        double R[9], tr = 0.0, s, c;
+        for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++) {
+                        s = 0.0;
+                        for (int k = 0; k < 3; k++)
+                                s += mat_get(quat_to_R(*qt), i, (size_t)k) *
+                                     mat_get(quat_to_R(*qf), j, (size_t)k);
+                        R[3*i+j] = s;
+                }
+        for (int i = 0; i < 3; i++) tr += R[3*i+i];
+        c = 0.5 * (tr - 1.0);
+        if (c > 1.0) c = 1.0;
+        if (c < -1.0) c = -1.0;
+        double th = acos(c);
+        if (th < 1e-9) { dth[0] = dth[1] = dth[2] = 0.0; return; }
+        s = 2.0 * sin(th);
+        dth[0] = th * (R[7] - R[5]) / s;
+        dth[1] = th * (R[2] - R[6]) / s;
+        dth[2] = th * (R[3] - R[1]) / s;
+}
+
+/* Angle between the two body-z axes in the world frame: the tilt error that
+ * leaks gravity into the horizontal plane. */
+static double tilt_deg(const quaternion_t *qf, const quaternion_t *qt) {
+        double d = 0.0;
+        for (int k = 0; k < 3; k++)
+                d += mat_get(quat_to_R(*qf), (size_t)k, 2) *
+                     mat_get(quat_to_R(*qt), (size_t)k, 2);
+        if (d > 1.0) d = 1.0;
+        if (d < -1.0) d = -1.0;
+        return acos(d) * 180.0 / M_PI;
+}
+
+/* Cholesky on P, returning the smallest pivot: negative means P is not positive
+ * definite. With sym set, factor 0.5*(P + P') instead, to separate a genuinely
+ * indefinite covariance from the asymmetry that (I - K H) P introduces. */
+static double Pchol[MAT_MAX*MAT_MAX];
+static double chol_min_pivot(const eskf_t *f, int sym) {
+        size_t d = state_dim(f), st = f->P.cols;
+        double lo = 1e300;
+        for (size_t i = 0; i < d; i++)
+                for (size_t j = 0; j <= i; j++) {
+                        double s = f->P.d[i*st+j];
+                        if (sym) s = 0.5 * (s + f->P.d[j*st+i]);
+                        for (size_t k = 0; k < j; k++) s -= Pchol[i*d+k] * Pchol[j*d+k];
+                        if (i == j) {
+                                if (s < lo) lo = s;
+                                Pchol[i*d+i] = (s > 0.0) ? sqrt(s) : 1e-300;
+                        } else {
+                                Pchol[i*d+j] = s / Pchol[j*d+j];
+                        }
+                }
+        return lo;
+}
+
+static double p_asym(const eskf_t *f) {
+        size_t d = state_dim(f), st = f->P.cols;
+        double m = 0.0;
+        for (size_t i = 0; i < d; i++)
+                for (size_t j = 0; j < i; j++) {
+                        double e = fabs(f->P.d[i*st+j] - f->P.d[j*st+i]);
+                        if (e > m) m = e;
+                }
+        return m;
+}
+
 int main(int argc, char *argv[]) {
         if (argc < 4) {
                 fprintf(stderr, "usage: %s <imu.csv> <gt.csv> <cam0 dir>\n", argv[0]);
@@ -130,6 +198,11 @@ int main(int argc, char *argv[]) {
         const char *diag_path = (argc >= 5) ? argv[4] : "diag.csv";
         double t_end = (argc >= 6) ? atof(argv[5]) : 0.0;
         double sigma_px = (argc >= 7) ? atof(argv[6]) : 3.0;
+        /* Accelerometer as a gravity-direction measurement; off by default
+         * (trusting it degrades the estimate — see eskf.c). */
+        double grav_gate  = (argc >= 8) ? atof(argv[7]) : 0.0;
+        double grav_sigma = (argc >= 9) ? atof(argv[8]) : 0.5;
+        int grav_ok = 0;
         int stop = 0;
         FILE *diag = fopen(diag_path, "w");
         if (diag)
@@ -137,7 +210,10 @@ int main(int argc, char *argv[]) {
                               "att_err_deg,n_live,n_dead,n_sub,n_trunc,nobs_sum,nobs_max,"
                               "nobs_all_max,trunc_min,trunc_max,n_clones,ok,rej,ok_frac,n_wtd,w_min,"
                               "r_k,r_tri,r_jac,r_null,r_chy,r_chi,iobs,vobs,nis_sum,nis_dof,"
-                              "var_tx,var_ty,var_tz,var_yaw\n");
+                              "var_tx,var_ty,var_tz,var_yaw,"
+                              "errx,erry,errz,verrx,verry,verrz,"
+                              "dthx,dthy,dthz,tilt_deg,asym,piv_raw,piv_sym,qw,qx,qy,qz,"
+                              "vprex,vprey,vprez,bax,bay,baz,bgx,bgy,bgz\n");
         else
                 fprintf(stderr, "warning: cannot open %s — diagnostics disabled\n", diag_path);
 
@@ -153,6 +229,8 @@ int main(int argc, char *argv[]) {
          * The direction is an average over the clone set, so its weights change
          * when the window resizes -- compare only frames with the same count. */
         double ndir[MAT_MAX];
+        int psd_fail = 0, psd_fail_sym = 0, have_pmin = 0;
+        double asym_max = 0.0, piv_raw_min = 1e300, piv_sym_min = 1e300;
         double ob[4];
         double ob_ref[4];       /* value at the first full-window frame */
         double ob_min[4], ob_max[4];
@@ -211,10 +289,16 @@ int main(int argc, char *argv[]) {
                                 int all_max = 0;         /* longest track offered this frame */
                                 int trunc_min = 0, trunc_max = 0;  /* length range of truncated tracks */
 
+                                if (eskf_update_gravity(&f, imu[k].accel, grav_gate, grav_sigma))
+                                        grav_ok++;
+
                                 eskf_augment(&f, cam[ic].timestamp);
                                 frontend_process(&fe, &img);
                                 double tf1 = now_s();
                                 t_front += tf1 - tf0;
+
+                                /* velocity as the update loop finds it */
+                                double vpre[3] = { f.vel.x, f.vel.y, f.vel.z };
 
                                 for (int d = 0; d < fe.n_dead; d++) {
                                         dead_track_t *tk = &fe.dead[d];
@@ -302,10 +386,30 @@ int main(int argc, char *argv[]) {
                                         double dot = f.q.w*gd->q.w + f.q.x*gd->q.x +
                                                      f.q.y*gd->q.y + f.q.z*gd->q.z;
                                         int nsub = f_ok + f_rej;
+                                        double verr[3] = { f.vel.x - gd->vel.x,
+                                                           f.vel.y - gd->vel.y,
+                                                           f.vel.z - gd->vel.z };
+                                        double dth[3], til;
+                                        att_err_vec(&f.q, &gd->q, dth);
+                                        til = tilt_deg(&f.q, &gd->q);
+                                        double asym = p_asym(&f);
+                                        double piv_raw = chol_min_pivot(&f, 0);
+                                        double piv_sym = chol_min_pivot(&f, 1);
+                                        if (piv_raw < 0.0) psd_fail++;
+                                        if (piv_sym < 0.0) psd_fail_sym++;
+                                        if (asym > asym_max) asym_max = asym;
+                                        if (piv_raw < piv_raw_min) piv_raw_min = piv_raw;
+                                        if (piv_sym < piv_sym_min) piv_sym_min = piv_sym;
+                                        have_pmin = 1;
                                         fprintf(diag,
                                                 "%.6f,%zu,%.4f,%.6f,%.6f,%.4f,%.4f,%.4f,"
                                                 "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d,%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d,"
-                                                "%.6e,%.6e,%.6e,%.6e\n",
+                                                "%.6e,%.6e,%.6e,%.6e,"
+                                                "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
+                                                "%.6e,%.6e,%.6e,%.4f,%.6e,%.6e,%.6e,"
+                                                "%.8f,%.8f,%.8f,%.8f,"
+                                                "%.6f,%.6f,%.6f,"
+                                                "%.6e,%.6e,%.6e,%.6e,%.6e,%.6e\n",
                                                 cam[ic].timestamp - imu[i0].timestamp, ic,
                                                 err, s1, s3,
                                                 (s1 > 0.0) ? err / s1 : 0.0,
@@ -327,7 +431,15 @@ int main(int argc, char *argv[]) {
                                                 msckf_valid_obs - vobs_before,
                                                 msckf_nis_sum - nis_before,
                                                 msckf_nis_dof - dof_before,
-                                                ob[0], ob[1], ob[2], ob[3]);
+                                                ob[0], ob[1], ob[2], ob[3],
+                                                dx, dy, dz,
+                                                verr[0], verr[1], verr[2],
+                                                dth[0], dth[1], dth[2], til,
+                                                asym, piv_raw, piv_sym,
+                                                f.q.w, f.q.x, f.q.y, f.q.z,
+                                                vpre[0], vpre[1], vpre[2],
+                                                f.ba.x, f.ba.y, f.ba.z,
+                                                f.bg.x, f.bg.y, f.bg.z);
                                 }
                                 image_free(&img);
                         }
@@ -380,6 +492,15 @@ int main(int argc, char *argv[]) {
                                (ob_ref[a] > 0.0) ? 100.0*ob_negsum[a] / ob_ref[a] : 0.0,
                                ob_ndrop[a]);
         }
+
+        if (have_pmin)
+                printf("P positive definite: %s  (raw %d frames, symmetrised %d frames)\n"
+                       "  min pivot: raw %.3e, symmetrised %.3e; max asymmetry %.3e\n",
+                       (psd_fail || psd_fail_sym) ? "NO" : "yes",
+                       psd_fail, psd_fail_sym,
+                       piv_raw_min, piv_sym_min, asym_max);
+        printf("gravity update applied in %d of %zu frames (gate %.2f m/s^2, sigma %.2f)\n",
+               grav_ok, ic, grav_gate, grav_sigma);
 
         double t_wall = now_s() - t_wall0;
         /* Span actually processed, not the span of the dataset: with the stop
