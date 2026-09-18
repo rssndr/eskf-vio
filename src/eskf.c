@@ -216,6 +216,76 @@ int eskf_update_gravity(eskf_t *f, vector_3d_t a_m, double gate, double sigma_a)
         return 1;
 }
 
+/* Velocity measurement against a reference, H on the velocity block only. With
+ * v_ref = 0 this is a zero-velocity update. With v_ref = the velocity at the
+ * start of a no-linear-acceleration stretch it is the weaker and stricter
+ * statement the accelerometer actually supports: delta v = 0, velocity only
+ * held, not zeroed. */
+int eskf_update_vel(eskf_t *f, vector_3d_t v_ref, double sigma_v) {
+        size_t n = 15 + 6 * (size_t)f->n_clones, st = f->P.cols;
+        if (sigma_v <= 0.0)
+                return 0;
+
+        static double H[3*MAT_MAX], PHt[MAT_MAX*3], tmp[MAT_MAX*MAT_MAX];
+        for (size_t j = 0; j < n; j++)
+                H[0*n+j] = H[1*n+j] = H[2*n+j] = 0.0;
+        for (size_t i = 0; i < 3; i++)
+                H[i*n + VEL + i] = 1.0;
+
+        double y[3] = { v_ref.x - f->vel.x, v_ref.y - f->vel.y, v_ref.z - f->vel.z };
+
+        for (size_t i = 0; i < n; i++)
+                for (size_t j = 0; j < 3; j++) {
+                        double s = 0.0;
+                        for (size_t k = 0; k < n; k++)
+                                s += f->P.d[i*st+k] * H[j*n+k];
+                        PHt[i*3+j] = s;
+                }
+
+        mat_t S = mat_zero(3, 3);
+        for (size_t i = 0; i < 3; i++)
+                for (size_t j = 0; j < 3; j++) {
+                        double s = 0.0;
+                        for (size_t k = 0; k < n; k++)
+                                s += H[i*n+k] * PHt[k*3+j];
+                        S.d[i*3+j] = s + (i == j ? sigma_v*sigma_v : 0.0);
+                }
+        mat_t Si = mat3_inv(S);
+
+        for (size_t i = 0; i < n; i++)
+                for (size_t j = 0; j < n; j++) {
+                        double s = 0.0;
+                        for (size_t k = 0; k < 3; k++) {
+                                double Kik = 0.0;
+                                for (size_t m = 0; m < 3; m++)
+                                        Kik += PHt[i*3+m] * Si.d[m*3+k];
+                                s += Kik * PHt[j*3+k];
+                        }
+                        tmp[i*n+j] = f->P.d[i*st+j] - s;
+                }
+        for (size_t i = 0; i < n; i++)
+                for (size_t j = 0; j < n; j++)
+                        f->P.d[i*st+j] = tmp[i*n+j];
+
+        mat_t dx = mat_zero(n, 1);
+        for (size_t i = 0; i < n; i++) {
+                double s = 0.0;
+                for (size_t j = 0; j < 3; j++) {
+                        double Kij = 0.0;
+                        for (size_t m = 0; m < 3; m++)
+                                Kij += PHt[i*3+m] * Si.d[m*3+j];
+                        s += Kij * y[j];
+                }
+                dx.d[i] = s;
+        }
+        eskf_inject(f, &dx);
+        return 1;
+}
+
+int eskf_update_zupt(eskf_t *f, double sigma_v) {
+        return eskf_update_vel(f, (vector_3d_t){ 0.0, 0.0, 0.0 }, sigma_v);
+}
+
 void eskf_update_pos(eskf_t *f, vector_3d_t z, double sigma_z) {
         size_t n = 15 + 6 * (size_t)f->n_clones;
 

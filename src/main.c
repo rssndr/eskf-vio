@@ -202,7 +202,15 @@ int main(int argc, char *argv[]) {
          * (trusting it degrades the estimate — see eskf.c). */
         double grav_gate  = (argc >= 8) ? atof(argv[7]) : 0.0;
         double grav_sigma = (argc >= 9) ? atof(argv[8]) : 0.5;
-        int grav_ok = 0;
+        /* Zero-velocity update while no linear acceleration is sustained. The
+         * detector runs at the IMU rate; |a| within 0.2 m/s^2 of g for 200
+         * consecutive samples (1 s) counts as stationary. 0 disables. */
+        double zupt_sigma = (argc >= 10) ? atof(argv[9]) : 0.05;
+        /* Hold the velocity at its value when the quiet stretch began, instead
+         * of zeroing it: the strict consequence of delta v = 0. 0 disables. */
+        double hold_sigma = (argc >= 11) ? atof(argv[10]) : 0.0;
+        vector_3d_t v_ref = { 0.0, 0.0, 0.0 };
+        int grav_ok = 0, zupt_ok = 0, hold_ok = 0, quiet_n = 0;
         int stop = 0;
         FILE *diag = fopen(diag_path, "w");
         if (diag)
@@ -213,7 +221,7 @@ int main(int argc, char *argv[]) {
                               "var_tx,var_ty,var_tz,var_yaw,"
                               "errx,erry,errz,verrx,verry,verrz,"
                               "dthx,dthy,dthz,tilt_deg,asym,piv_raw,piv_sym,qw,qx,qy,qz,"
-                              "vprex,vprey,vprez,bax,bay,baz,bgx,bgy,bgz\n");
+                              "vprex,vprey,vprez,bax,bay,baz,bgx,bgy,bgz,svel,satt\n");
         else
                 fprintf(stderr, "warning: cannot open %s — diagnostics disabled\n", diag_path);
 
@@ -266,6 +274,13 @@ int main(int argc, char *argv[]) {
                 eskf_predict(&f, imu[k], dt);
                 t_prop += now_s() - tp0;
 
+                {
+                        double ax = imu[k].accel.x, ay = imu[k].accel.y, az = imu[k].accel.z;
+                        double am = sqrt(ax*ax + ay*ay + az*az);
+                        quiet_n = (fabs(am - 9.81) < 0.2) ? quiet_n + 1 : 0;
+                        if (quiet_n == 201) v_ref = f.vel;
+                }
+
                 if (ic < ncam && cam[ic].timestamp <= imu[k+1].timestamp) {
                         if (t_end > 0.0 && cam[ic].timestamp - imu[i0].timestamp > t_end) {
                                 stop = 1;
@@ -291,6 +306,10 @@ int main(int argc, char *argv[]) {
 
                                 if (eskf_update_gravity(&f, imu[k].accel, grav_gate, grav_sigma))
                                         grav_ok++;
+                                if (quiet_n > 200 && eskf_update_zupt(&f, zupt_sigma))
+                                        zupt_ok++;
+                                if (quiet_n > 200 && eskf_update_vel(&f, v_ref, hold_sigma))
+                                        hold_ok++;
 
                                 eskf_augment(&f, cam[ic].timestamp);
                                 frontend_process(&fe, &img);
@@ -409,7 +428,8 @@ int main(int argc, char *argv[]) {
                                                 "%.6e,%.6e,%.6e,%.4f,%.6e,%.6e,%.6e,"
                                                 "%.8f,%.8f,%.8f,%.8f,"
                                                 "%.6f,%.6f,%.6f,"
-                                                "%.6e,%.6e,%.6e,%.6e,%.6e,%.6e\n",
+                                                "%.6e,%.6e,%.6e,%.6e,%.6e,%.6e,"
+                                                "%.6f,%.6f\n",
                                                 cam[ic].timestamp - imu[i0].timestamp, ic,
                                                 err, s1, s3,
                                                 (s1 > 0.0) ? err / s1 : 0.0,
@@ -439,7 +459,9 @@ int main(int argc, char *argv[]) {
                                                 f.q.w, f.q.x, f.q.y, f.q.z,
                                                 vpre[0], vpre[1], vpre[2],
                                                 f.ba.x, f.ba.y, f.ba.z,
-                                                f.bg.x, f.bg.y, f.bg.z);
+                                                f.bg.x, f.bg.y, f.bg.z,
+                                                sqrt(mat_get(f.P, 3, 3) + mat_get(f.P, 4, 4) + mat_get(f.P, 5, 5)),
+                                                sqrt(mat_get(f.P, 6, 6) + mat_get(f.P, 7, 7) + mat_get(f.P, 8, 8)));
                                 }
                                 image_free(&img);
                         }
@@ -501,6 +523,10 @@ int main(int argc, char *argv[]) {
                        piv_raw_min, piv_sym_min, asym_max);
         printf("gravity update applied in %d of %zu frames (gate %.2f m/s^2, sigma %.2f)\n",
                grav_ok, ic, grav_gate, grav_sigma);
+        printf("zero-velocity update applied in %d frames (sigma %.3f m/s)\n",
+               zupt_ok, zupt_sigma);
+        printf("velocity-hold update applied in %d frames (sigma %.3f m/s)\n",
+               hold_ok, hold_sigma);
 
         double t_wall = now_s() - t_wall0;
         /* Span actually processed, not the span of the dataset: with the stop

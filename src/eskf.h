@@ -26,6 +26,8 @@ void eskf_init(eskf_t *f, quaternion_t q, vector_3d_t pos, vector_3d_t vel,
 void eskf_predict(eskf_t *f, imu_sample_t s, double dt);
 void eskf_update_pos(eskf_t *f, vector_3d_t z, double sigma_z);
 int  eskf_update_gravity(eskf_t *f, vector_3d_t a_m, double gate, double sigma_a);
+int  eskf_update_zupt(eskf_t *f, double sigma_v);
+int  eskf_update_vel(eskf_t *f, vector_3d_t v_ref, double sigma_v);
 void eskf_augment(eskf_t *f, double timestamp);
 void eskf_inject(eskf_t *f, const mat_t *dx);
 
