@@ -121,7 +121,7 @@ int main(void) {
         double pv0 = mat_get(f.P, 15, 15);
         vector_3d_t before[6];
         for (int i = 0; i < 6; i++) before[i] = f.clones[i].pos;
-        int ret = msckf_update_track(&f, ci, obs, 6, sigma);
+        int ret = msckf_update_track(&f, ci, obs, 6, sigma, NULL);
         check("upd: perfect obs accepted", ret == 1);
         double mv = 0;
         for (int i = 0; i < 6; i++) {
@@ -152,7 +152,7 @@ int main(void) {
                 e0 += fabs(f.clones[i].pos.x - truth[i].x)
                     + fabs(f.clones[i].pos.y - truth[i].y)
                     + fabs(f.clones[i].pos.z - truth[i].z);
-        ret = msckf_update_track(&f, ci, obs, 6, sigma);
+        ret = msckf_update_track(&f, ci, obs, 6, sigma, NULL);
         double e1 = 0;
         for (int i = 0; i < 6; i++)
                 e1 += fabs(f.clones[i].pos.x - truth[i].x)
@@ -166,9 +166,27 @@ int main(void) {
         pt2_t bad[6];
         for (int i = 0; i < 6; i++) bad[i] = obs[i];
         bad[2].x += 0.1;
-        ret = msckf_update_track(&f, ci, bad, 6, sigma);
-        check("gate: outlier rejected", ret == 0);
-        check("gate: P untouched", mat_get(f.P,0,0) == p00 && mat_get(f.P,20,20) == p20);
+
+        /* One outlier in six observations. The Huber reweight went in with the
+         * chi-squared gate replacement: the track is accepted and down-weighted
+         * rather than thrown away. So the assertion is no longer "rejected and P
+         * untouched" -- it is the stronger pair: the weight must actually bite,
+         * and the outlier must move the covariance strictly less than the same
+         * update would with clean observations. Two copies of the filter,
+         * identical before the update, make that a direct comparison. */
+        eskf_t fc = f;
+        double w = 1.0;
+        ret = msckf_update_track(&f, ci, bad, 6, sigma, &w);
+        printf("  outlier: ret %d, Huber weight %.4f\n", ret, w);
+        check("huber: outlier accepted, not rejected", ret == 1);
+        check("huber: weight bites", w > 0.0 && w < 0.2);
+
+        (void)msckf_update_track(&fc, ci, obs, 6, sigma, NULL);
+        double drop_bad   = (p00 - mat_get(f.P, 0, 0))   + (p20 - mat_get(f.P, 20, 20));
+        double drop_clean = (p00 - mat_get(fc.P, 0, 0))  + (p20 - mat_get(fc.P, 20, 20));
+        printf("  P drop: outlier %.3e, clean obs %.3e\n", drop_bad, drop_clean);
+        check("huber: P still moved by the outlier", drop_bad > 0.0);
+        check("huber: outlier shrinks P less than clean obs", drop_bad < drop_clean);
 
         printf(nfail ? "FAIL (%d)\n" : "PASS\n", nfail);
         return nfail != 0;

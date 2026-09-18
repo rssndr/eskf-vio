@@ -24,6 +24,106 @@ static size_t gt_nearest(const gt_sample_t *gt, size_t n, double t) {
         return n - 1;
 }
 
+/* ---- observability diagnostic (passive: reads f, never writes it) -------
+ *
+ * A monocular VIO system cannot observe four directions of its own state: the
+ * three global translations, and rotation about the gravity axis. Along those
+ * directions the covariance must therefore NOT shrink. Prediction adds no
+ * process noise there, and no measurement can carry information there, so a
+ * correct filter simply cannot learn anything about them. If the covariance
+ * does shrink, the filter is inventing information about a direction it cannot
+ * see -- that is what "overconfident" means, and this turns it into a number.
+ *
+ * The directions are exact, not approximations. With the state laid out as in
+ * eskf.c -- [0..2] pos, [3..5] vel, [6..8] attitude, [9..11] ba, [12..14] bg,
+ * then 6 per clone (position, attitude) from index 15:
+ *
+ *   translation along world axis i:
+ *       dp = e_i on the body position AND on every clone position; nothing
+ *       else moves. F n = n exactly (the POS<-VEL coupling needs a velocity
+ *       component, and there is none), and n'Qn = 0 exactly (Q is non-zero
+ *       only on VEL, TH, BA, BG). So the variance along it is a CONSTANT, and
+ *       any decrease is spurious information, full stop.
+ *
+ *   rotation about world z:
+ *       dp = e_z x p, dv = e_z x v, dtheta = R' e_z on the body and every
+ *       clone. F n = n to first order in dt. Here Q does inject noise, so the
+ *       variance may grow -- but it must never DECREASE.
+ *
+ * R' e_z is the third row of the body-to-world rotation: the attitude error is
+ * right-multiplied (q_true = q * exp(dtheta), see eskf_inject), so a world-frame
+ * yaw corresponds to a body-frame axis R' e_z. The convention is checked once
+ * against eskf.c's quat_to_R() at startup rather than assumed.
+ *
+ * n'Pn is read straight out of f.P.d[] because mat_get() copies all 51,200
+ * bytes of mat_t by value -- a 75x75 loop through it would move a gigabyte per
+ * frame and wreck the timing report. It runs outside the t_front and t_upd
+ * spans; at ~22,500 mul-adds per frame against a 223 ms frame it is 0.003%.
+ */
+
+/* Third row of the body-to-world rotation, i.e. R' e_z. Same formula and
+ * convention as quat_to_R() in eskf.c, repeated here because that function
+ * returns a 51,200-byte mat_t and this runs once per clone per frame. */
+static void R_row2(const quaternion_t *q, double out[3]) {
+        out[0] = 2.0 * (q->x*q->z - q->y*q->w);
+        out[1] = 2.0 * (q->y*q->z + q->x*q->w);
+        out[2] = 1.0 - 2.0 * (q->x*q->x + q->y*q->y);
+}
+
+mat_t quat_to_R(quaternion_t q);   /* defined in eskf.c, not in eskf.h */
+
+static size_t state_dim(const eskf_t *f) {
+        return 15 + 6 * (size_t)f->n_clones;
+}
+
+static void dir_translation(const eskf_t *f, int axis, double *n) {
+        size_t d = state_dim(f);
+        for (size_t i = 0; i < d; i++) n[i] = 0.0;
+        double s = 1.0 / sqrt((double)(1 + f->n_clones));
+        n[(size_t)axis] = s;
+        for (int c = 0; c < f->n_clones; c++)
+                n[15 + 6*(size_t)c + (size_t)axis] = s;
+}
+
+static void dir_yaw(const eskf_t *f, double *n) {
+        size_t d = state_dim(f);
+        for (size_t i = 0; i < d; i++) n[i] = 0.0;
+
+        double r[3];
+        n[0] = -f->pos.y;  n[1] = f->pos.x;          /* e_z x p */
+        n[3] = -f->vel.y;  n[4] = f->vel.x;          /* e_z x v */
+        R_row2(&f->q, r);
+        n[6] = r[0];  n[7] = r[1];  n[8] = r[2];     /* R' e_z */
+
+        for (int c = 0; c < f->n_clones; c++) {
+                size_t q = 15 + 6*(size_t)c;
+                n[q+0] = -f->clones[c].pos.y;
+                n[q+1] =  f->clones[c].pos.x;
+                R_row2(&f->clones[c].q, r);
+                n[q+3] = r[0];  n[q+4] = r[1];  n[q+5] = r[2];
+        }
+
+        double s = 0.0;
+        for (size_t i = 0; i < d; i++) s += n[i]*n[i];
+        s = sqrt(s);
+        if (s > 0.0)
+                for (size_t i = 0; i < d; i++) n[i] /= s;
+}
+
+static double dir_var(const eskf_t *f, const double *n) {
+        size_t d = state_dim(f);
+        double v = 0.0;
+        for (size_t i = 0; i < d; i++) {
+                if (n[i] == 0.0) continue;
+                const double *row = f->P.d + i * MAT_MAX;
+                double acc = 0.0;
+                for (size_t j = 0; j < d; j++)
+                        acc += row[j] * n[j];
+                v += n[i] * acc;
+        }
+        return v;
+}
+
 int main(int argc, char *argv[]) {
         if (argc < 4) {
                 fprintf(stderr, "usage: %s <imu.csv> <gt.csv> <cam0 dir>\n", argv[0]);
@@ -84,7 +184,8 @@ int main(int argc, char *argv[]) {
                 fprintf(diag, "t,frame,pos_err,sigma_1d,sigma_3d,ratio_1d,ratio_3d,"
                               "att_err_deg,n_live,n_dead,n_sub,n_trunc,nobs_sum,nobs_max,"
                               "nobs_all_max,trunc_min,trunc_max,n_clones,ok,rej,ok_frac,n_wtd,w_min,"
-                              "r_k,r_tri,r_jac,r_null,r_chy,r_chi,iobs,vobs,nis_sum,nis_dof\n");
+                              "r_k,r_tri,r_jac,r_null,r_chy,r_chi,iobs,vobs,nis_sum,nis_dof,"
+                              "var_tx,var_ty,var_tz,var_yaw\n");
         else
                 fprintf(stderr, "warning: cannot open %s — diagnostics disabled\n", diag_path);
 
@@ -98,6 +199,48 @@ int main(int argc, char *argv[]) {
         double t_prop = 0.0, t_front = 0.0, t_upd = 0.0;
         size_t k_last = i0;   /* last IMU sample processed, for the true span */
         double t_wall0 = now_s();
+
+        /* Observability diagnostic state. Index 0-2 = translation along world
+         * x/y/z, index 3 = rotation about world z.
+         *
+         * The direction vector is an average over the body position and every
+         * clone position, so its weights depend on the clone count. The raw value
+         * therefore moves whenever the window changes size -- bookkeeping, not
+         * information. Only two frames with the SAME clone count have identical
+         * weights, so only those pairs are compared. Once the window is full
+         * (MAX_CLONES, reached after the first 10 camera frames) the count stops
+         * changing, so every later frame is comparable with its predecessor. */
+        double ndir[MAT_MAX];
+        double ob[4];
+        double ob_ref[4];       /* value at the first full-window frame */
+        double ob_min[4], ob_max[4];
+        double ob_worst[4];     /* most negative single-frame change */
+        double ob_negsum[4];    /* sum of every negative change */
+        int    ob_ndrop[4];
+        double ob_prev[4];
+        int have_full = 0, have_prev = 0, prev_c = -1;
+        for (int a = 0; a < 4; a++) {
+                ob[a] = ob_ref[a] = ob_prev[a] = 0.0;
+                ob_min[a] = 1e300;
+                ob_max[a] = -1e300;
+                ob_worst[a] = 0.0;
+                ob_negsum[a] = 0.0;
+                ob_ndrop[a] = 0;
+        }
+        {
+                /* Check R_row2() against eskf.c's quat_to_R() once, so the yaw
+                 * direction rests on a verified convention and not on a guess
+                 * about how the attitude error is applied. */
+                double r[3];
+                mat_t R = quat_to_R(f.q);
+                R_row2(&f.q, r);
+                double dm = 0.0;
+                for (int k = 0; k < 3; k++) {
+                        double e = fabs(r[k] - mat_get(R, 2, (size_t)k));
+                        if (e > dm) dm = e;
+                }
+                printf("convention check: |R_row2 - quat_to_R row 2| = %.3e\n\n", dm);
+        }
 
         for (size_t k = i0; k < n-1 && !stop; k++) {
                 k_last = k;
@@ -184,6 +327,40 @@ int main(int argc, char *argv[]) {
                                 }
                                 t_upd += now_s() - tf1;
 
+                                /* Unobservable-direction variances. Outside
+                                 * both stage spans, reads f only. */
+                                {
+                                        for (int a = 0; a < 3; a++) {
+                                                dir_translation(&f, a, ndir);
+                                                ob[a] = dir_var(&f, ndir);
+                                        }
+                                        dir_yaw(&f, ndir);
+                                        ob[3] = dir_var(&f, ndir);
+
+                                        int c = f.n_clones;
+                                        if (have_prev && c == prev_c)
+                                                for (int a = 0; a < 4; a++) {
+                                                        double d = ob[a] - ob_prev[a];
+                                                        if (d < 0.0) {
+                                                                ob_negsum[a] += d;
+                                                                ob_ndrop[a]++;
+                                                                if (d < ob_worst[a]) ob_worst[a] = d;
+                                                        }
+                                                }
+                                        for (int a = 0; a < 4; a++) ob_prev[a] = ob[a];
+                                        prev_c = c;
+                                        have_prev = 1;
+                                        if (c == MAX_CLONES) {
+                                                if (!have_full)
+                                                        for (int a = 0; a < 4; a++) ob_ref[a] = ob[a];
+                                                for (int a = 0; a < 4; a++) {
+                                                        if (ob[a] < ob_min[a]) ob_min[a] = ob[a];
+                                                        if (ob[a] > ob_max[a]) ob_max[a] = ob[a];
+                                                }
+                                                have_full = 1;
+                                        }
+                                }
+
                                 if (diag) {
                                         gt_sample_t *gd = &gt[gt_nearest(gt, m, cam[ic].timestamp)];
                                         double dx = f.pos.x - gd->pos.x;
@@ -199,7 +376,8 @@ int main(int argc, char *argv[]) {
                                         int nsub = f_ok + f_rej;
                                         fprintf(diag,
                                                 "%.6f,%zu,%.4f,%.6f,%.6f,%.4f,%.4f,%.4f,"
-                                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d,%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d\n",
+                                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d,%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d,"
+                                                "%.6e,%.6e,%.6e,%.6e\n",
                                                 cam[ic].timestamp - imu[i0].timestamp, ic,
                                                 err, s1, s3,
                                                 (s1 > 0.0) ? err / s1 : 0.0,
@@ -220,7 +398,8 @@ int main(int argc, char *argv[]) {
                                                 msckf_invalid_obs - iobs_before,
                                                 msckf_valid_obs - vobs_before,
                                                 msckf_nis_sum - nis_before,
-                                                msckf_nis_dof - dof_before);
+                                                msckf_nis_dof - dof_before,
+                                                ob[0], ob[1], ob[2], ob[3]);
                                 }
                                 image_free(&img);
                         }
@@ -254,6 +433,29 @@ int main(int argc, char *argv[]) {
                        msckf_nis_sum / msckf_nis_dof,
                        msckf_nis_sum / (updates_ok ? updates_ok : 1),
                        msckf_nis_dof, updates_ok);
+
+        /* The headline. A correct filter gains NO information along these
+         * directions: prediction adds none (n'Qn = 0 for translation, exactly)
+         * and no measurement can. So the value is either exactly constant or
+         * growing through Q, and every fall is information the filter cannot
+         * have. 'ref' is the first frame with a full window; only frames with the
+         * same clone count are compared, which after those first MAX_CLONES
+         * frames is all of them. */
+        if (have_full) {
+                static const char *nm[4] = { "translation x", "translation y",
+                                             "translation z", "yaw about z" };
+                printf("\nunobservable directions -- P along a direction the camera cannot see\n");
+                printf("compared only between frames with the same clone count;\n"
+                       "'worst' and 'total' are the falls, as %% of the first full-window value\n\n");
+                printf("%-15s %12s %12s %12s %12s %12s %6s\n",
+                       "direction", "ref", "min", "max", "worst fall", "total fall", "falls");
+                for (int a = 0; a < 4; a++)
+                        printf("%-15s %12.4e %12.4e %12.4e %11.4f%% %11.4f%% %6d\n",
+                               nm[a], ob_ref[a], ob_min[a], ob_max[a],
+                               (ob_ref[a] > 0.0) ? 100.0*ob_worst[a]  / ob_ref[a] : 0.0,
+                               (ob_ref[a] > 0.0) ? 100.0*ob_negsum[a] / ob_ref[a] : 0.0,
+                               ob_ndrop[a]);
+        }
 
         double t_wall = now_s() - t_wall0;
         /* Span actually processed, not the span of the dataset: with the stop
