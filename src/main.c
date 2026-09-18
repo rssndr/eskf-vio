@@ -62,8 +62,8 @@ int main(int argc, char *argv[]) {
         FILE *diag = fopen(diag_path, "w");
         if (diag)
                 fprintf(diag, "t,frame,pos_err,sigma_1d,sigma_3d,ratio_1d,ratio_3d,"
-                              "att_err_deg,n_live,n_dead,n_sub,n_skip,nobs_sum,nobs_max,"
-                              "nobs_all_max,skip_min,skip_max,n_clones,ok,rej,ok_frac\n");
+                              "att_err_deg,n_live,n_dead,n_sub,n_trunc,nobs_sum,nobs_max,"
+                              "nobs_all_max,trunc_min,trunc_max,n_clones,ok,rej,ok_frac\n");
         else
                 fprintf(stderr, "warning: cannot open %s — diagnostics disabled\n", diag_path);
 
@@ -77,10 +77,10 @@ int main(int argc, char *argv[]) {
                         snprintf(path, sizeof path, "%s/data/%s", cam_dir, cam[ic].filename);
                         image_t img;
                         if (image_load(path, &img) == 0) {
-                                int f_ok = 0, f_rej = 0, f_sub = 0, f_skip = 0;
+                                int f_ok = 0, f_rej = 0, f_sub = 0, f_trunc = 0;
                                 int nobs_sum = 0, nobs_max = 0;
-                                int all_max = 0;          /* longest track offered this frame */
-                                int skip_min = 0, skip_max = 0;  /* length range of skipped tracks */
+                                int all_max = 0;         /* longest track offered this frame */
+                                int trunc_min = 0, trunc_max = 0;  /* length range of truncated tracks */
 
                                 eskf_augment(&f, cam[ic].timestamp);
                                 frontend_process(&fe, &img);
@@ -89,19 +89,38 @@ int main(int argc, char *argv[]) {
                                         dead_track_t *tk = &fe.dead[d];
                                         int kk = tk->nobs;
                                         if (kk > all_max) all_max = kk;
-                                        if (kk > f.n_clones) {
-                                                if (f_skip == 0 || kk < skip_min) skip_min = kk;
-                                                if (kk > skip_max) skip_max = kk;
-                                                f_skip++;
-                                                continue;
+
+                                        /* Truncate, never discard, and pair by frame.
+                                         *
+                                         * A dead track's newest observation is ALWAYS from
+                                         * frame F-1, because harvest() copies hist[0..n-1]
+                                         * before the current frame's observation is
+                                         * appended. The newest clone, index n_clones-1, is
+                                         * frame F. So the newest observation pairs with
+                                         * clone n_clones-2, not n_clones-1:
+                                         *
+                                         *   clone index for frame f = n_clones - 1 - (F - f)
+                                         *   obs[j] is frame F - ks + j  ->  ci[j] = n_clones - 1 - ks + j
+                                         *
+                                         * The window is therefore one effective clone
+                                         * smaller than the array: kmax = n_clones - 1.
+                                         * The oldest `off` observations are dropped.
+                                         */
+                                        int kmax = f.n_clones - 1;
+                                        int ks   = (kk > kmax) ? kmax : kk;
+                                        int off  = kk - ks;
+                                        if (off > 0) {
+                                                if (f_trunc == 0 || kk < trunc_min) trunc_min = kk;
+                                                if (kk > trunc_max) trunc_max = kk;
+                                                f_trunc++;
                                         }
                                         int ci[FE_HIST];
-                                        for (int j = 0; j < kk; j++)
-                                                ci[j] = f.n_clones - kk + j;
+                                        for (int j = 0; j < ks; j++)
+                                                ci[j] = f.n_clones - 1 - ks + j;
                                         f_sub++;
-                                        nobs_sum += kk;
-                                        if (kk > nobs_max) nobs_max = kk;
-                                        if (msckf_update_track(&f, ci, tk->obs, kk, 3.0/458.0)) {
+                                        nobs_sum += ks;
+                                        if (ks > nobs_max) nobs_max = ks;
+                                        if (msckf_update_track(&f, ci, tk->obs + off, ks, 3.0/458.0)) {
                                                 updates_ok++;
                                                 f_ok++;
                                         } else {
@@ -131,9 +150,9 @@ int main(int argc, char *argv[]) {
                                                 (s1 > 0.0) ? err / s1 : 0.0,
                                                 (s3 > 0.0) ? err / s3 : 0.0,
                                                 2.0 * acos(fabs(dot)) * 180.0 / M_PI,
-                                                fe.n, fe.n_dead, f_sub, f_skip,
+                                                fe.n, fe.n_dead, f_sub, f_trunc,
                                                 nobs_sum, nobs_max,
-                                                all_max, skip_min, skip_max, f.n_clones,
+                                                all_max, trunc_min, trunc_max, f.n_clones,
                                                 f_ok, f_rej,
                                                 (nsub > 0) ? (double)f_ok / (double)nsub : 0.0);
                                 }
