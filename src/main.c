@@ -9,8 +9,6 @@
 #include "frontend.h"
 #include "msckf.h"
 
-/* Monotonic wall clock for the stage timing report. Diagnostic only: nothing
- * downstream reads it, so the estimator's numbers stay bit-identical. */
 static double now_s(void) {
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -24,53 +22,16 @@ static size_t gt_nearest(const gt_sample_t *gt, size_t n, double t) {
         return n - 1;
 }
 
-/* ---- observability diagnostic (passive: reads f, never writes it) -------
- *
- * A monocular VIO system cannot observe four directions of its own state: the
- * three global translations, and rotation about the gravity axis. Along those
- * directions the covariance must therefore NOT shrink. Prediction adds no
- * process noise there, and no measurement can carry information there, so a
- * correct filter simply cannot learn anything about them. If the covariance
- * does shrink, the filter is inventing information about a direction it cannot
- * see -- that is what "overconfident" means, and this turns it into a number.
- *
- * The directions are exact, not approximations. With the state laid out as in
- * eskf.c -- [0..2] pos, [3..5] vel, [6..8] attitude, [9..11] ba, [12..14] bg,
- * then 6 per clone (position, attitude) from index 15:
- *
- *   translation along world axis i:
- *       dp = e_i on the body position AND on every clone position; nothing
- *       else moves. F n = n exactly (the POS<-VEL coupling needs a velocity
- *       component, and there is none), and n'Qn = 0 exactly (Q is non-zero
- *       only on VEL, TH, BA, BG). So the variance along it is a CONSTANT, and
- *       any decrease is spurious information, full stop.
- *
- *   rotation about world z:
- *       dp = e_z x p, dv = e_z x v, dtheta = R' e_z on the body and every
- *       clone. F n = n to first order in dt. Here Q does inject noise, so the
- *       variance may grow -- but it must never DECREASE.
- *
- * R' e_z is the third row of the body-to-world rotation: the attitude error is
- * right-multiplied (q_true = q * exp(dtheta), see eskf_inject), so a world-frame
- * yaw corresponds to a body-frame axis R' e_z. The convention is checked once
- * against eskf.c's quat_to_R() at startup rather than assumed.
- *
- * n'Pn is read straight out of f.P.d[] because mat_get() copies all 51,200
- * bytes of mat_t by value -- a 75x75 loop through it would move a gigabyte per
- * frame and wreck the timing report. It runs outside the t_front and t_upd
- * spans; at ~22,500 mul-adds per frame against a 223 ms frame it is 0.003%.
- */
-
-/* Third row of the body-to-world rotation, i.e. R' e_z. Same formula and
- * convention as quat_to_R() in eskf.c, repeated here because that function
- * returns a 51,200-byte mat_t and this runs once per clone per frame. */
+/* Observability diagnostic. Projects P onto the four directions a monocular
+ * VIO cannot observe -- the three global translations, and yaw about gravity --
+ * so the value can only grow, never fall. */
 static void R_row2(const quaternion_t *q, double out[3]) {
         out[0] = 2.0 * (q->x*q->z - q->y*q->w);
         out[1] = 2.0 * (q->y*q->z + q->x*q->w);
         out[2] = 1.0 - 2.0 * (q->x*q->x + q->y*q->y);
 }
 
-mat_t quat_to_R(quaternion_t q);   /* defined in eskf.c, not in eskf.h */
+mat_t quat_to_R(quaternion_t q);   /* eskf.c */
 
 static size_t state_dim(const eskf_t *f) {
         return 15 + 6 * (size_t)f->n_clones;
@@ -110,12 +71,15 @@ static void dir_yaw(const eskf_t *f, double *n) {
                 for (size_t i = 0; i < d; i++) n[i] /= s;
 }
 
+/* n'Pn. mat_t stores with stride P.cols == state dim, NOT MAT_MAX. */
 static double dir_var(const eskf_t *f, const double *n) {
         size_t d = state_dim(f);
+        size_t st = f->P.cols;
+        if (st == 0) return 0.0;
         double v = 0.0;
         for (size_t i = 0; i < d; i++) {
                 if (n[i] == 0.0) continue;
-                const double *row = f->P.d + i * MAT_MAX;
+                const double *row = f->P.d + i * st;
                 double acc = 0.0;
                 for (size_t j = 0; j < d; j++)
                         acc += row[j] * n[j];
@@ -162,21 +126,9 @@ int main(int argc, char *argv[]) {
 
         int updates_ok = 0, updates_rej = 0;
 
-        /* ---- diagnostics (passive: reads state, never changes it) ----
-         * Optional 4th argument selects the CSV path. Default "diag.csv".
-         * Every value written below is already computed by the run; nothing
-         * here feeds back into the estimator.
-         */
+        /* argv[4] = CSV path, argv[5] = stop [s], argv[6] = measurement sigma [px] */
         const char *diag_path = (argc >= 5) ? argv[4] : "diag.csv";
-        /* Optional 5th argument: stop after this many seconds of sequence.
-         * Diagnostic-only. Window 1 lives at t = 20-45 s, so a 50 s run answers
-         * most questions in a quarter of the time. The estimator path is
-         * untouched; the same frames produce the same numbers. */
         double t_end = (argc >= 6) ? atof(argv[5]) : 0.0;
-        /* Optional 6th argument: measurement noise in pixels (default 3.0).
-         * Expressed against the focal length to get normalized units, which is
-         * what the filter wants. Exposed so the noise model can be swept
-         * against the overconfidence ratio instead of being assumed. */
         double sigma_px = (argc >= 7) ? atof(argv[6]) : 3.0;
         int stop = 0;
         FILE *diag = fopen(diag_path, "w");
@@ -191,25 +143,15 @@ int main(int argc, char *argv[]) {
 
         printf("%-8s %-12s %-12s %-10s\n", "t [s]", "pos err [m]", "pred +- [m]", "att err [deg]");
 
-        /* Stage timing. Answers "what do I optimise" with a measurement instead
-         * of arithmetic: how much of the run is the MSCKF update, and how much
-         * is the front-end. RT frac is that stage's total divided by the flight
-         * duration, so a value above 1.00 means the stage alone is slower than
+        /* Stage timing. RT frac > 1.00 means that stage alone is slower than
          * real time. */
         double t_prop = 0.0, t_front = 0.0, t_upd = 0.0;
         size_t k_last = i0;   /* last IMU sample processed, for the true span */
         double t_wall0 = now_s();
 
-        /* Observability diagnostic state. Index 0-2 = translation along world
-         * x/y/z, index 3 = rotation about world z.
-         *
-         * The direction vector is an average over the body position and every
-         * clone position, so its weights depend on the clone count. The raw value
-         * therefore moves whenever the window changes size -- bookkeeping, not
-         * information. Only two frames with the SAME clone count have identical
-         * weights, so only those pairs are compared. Once the window is full
-         * (MAX_CLONES, reached after the first 10 camera frames) the count stops
-         * changing, so every later frame is comparable with its predecessor. */
+        /* Observability diagnostic: index 0-2 = translation x/y/z, 3 = yaw.
+         * The direction is an average over the clone set, so its weights change
+         * when the window resizes -- compare only frames with the same count. */
         double ndir[MAT_MAX];
         double ob[4];
         double ob_ref[4];       /* value at the first full-window frame */
@@ -228,9 +170,6 @@ int main(int argc, char *argv[]) {
                 ob_ndrop[a] = 0;
         }
         {
-                /* Check R_row2() against eskf.c's quat_to_R() once, so the yaw
-                 * direction rests on a verified convention and not on a guess
-                 * about how the attitude error is applied. */
                 double r[3];
                 mat_t R = quat_to_R(f.q);
                 R_row2(&f.q, r);
@@ -282,22 +221,12 @@ int main(int argc, char *argv[]) {
                                         int kk = tk->nobs;
                                         if (kk > all_max) all_max = kk;
 
-                                        /* Truncate, never discard, and pair by frame.
-                                         *
-                                         * A dead track's newest observation is ALWAYS from
-                                         * frame F-1, because harvest() copies hist[0..n-1]
-                                         * before the current frame's observation is
-                                         * appended. The newest clone, index n_clones-1, is
-                                         * frame F. So the newest observation pairs with
-                                         * clone n_clones-2, not n_clones-1:
-                                         *
-                                         *   clone index for frame f = n_clones - 1 - (F - f)
-                                         *   obs[j] is frame F - ks + j  ->  ci[j] = n_clones - 1 - ks + j
-                                         *
-                                         * The window is therefore one effective clone
-                                         * smaller than the array: kmax = n_clones - 1.
-                                         * The oldest `off` observations are dropped.
-                                         */
+                                        /* Pair by frame: a dead track's newest
+                                         * observation is frame F-1 while clone
+                                         * n_clones-1 is frame F, so
+                                         * ci[j] = n_clones-1-ks+j and the usable
+                                         * window is n_clones-1. Truncate the oldest
+                                         * observations; do not discard the track. */
                                         int kmax = f.n_clones - 1;
                                         int ks   = (kk > kmax) ? kmax : kk;
                                         int off  = kk - ks;
@@ -327,8 +256,7 @@ int main(int argc, char *argv[]) {
                                 }
                                 t_upd += now_s() - tf1;
 
-                                /* Unobservable-direction variances. Outside
-                                 * both stage spans, reads f only. */
+                                /* Unobservable-direction variances. */
                                 {
                                         for (int a = 0; a < 3; a++) {
                                                 dir_translation(&f, a, ndir);
@@ -434,13 +362,9 @@ int main(int argc, char *argv[]) {
                        msckf_nis_sum / (updates_ok ? updates_ok : 1),
                        msckf_nis_dof, updates_ok);
 
-        /* The headline. A correct filter gains NO information along these
-         * directions: prediction adds none (n'Qn = 0 for translation, exactly)
-         * and no measurement can. So the value is either exactly constant or
-         * growing through Q, and every fall is information the filter cannot
-         * have. 'ref' is the first frame with a full window; only frames with the
-         * same clone count are compared, which after those first MAX_CLONES
-         * frames is all of them. */
+        /* A correct filter gains no information along these directions, so every
+         * fall is information it cannot have. Only frames with the same clone
+         * count are compared. */
         if (have_full) {
                 static const char *nm[4] = { "translation x", "translation y",
                                              "translation z", "yaw about z" };

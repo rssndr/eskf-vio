@@ -4,11 +4,7 @@
 
 extern mat_t quat_to_R(quaternion_t q);
 
-/* Number of views in which x has a non-positive camera-frame depth, and the
- * mean camera centre of the window.
- *
- * Depth in view i is row 2 of R_CW applied to (x - c_i), and row 2 of R_CW is
- * column 2 of R_WC — the same expression obs_jacobian() uses for its z. */
+/* Views where x is behind the camera, and the mean camera centre. */
 static int count_bad_depths(const clone_t *cl, int n, vector_3d_t x, vector_3d_t *cmean) {
         double mx = 0, my = 0, mz = 0;
         int bad = 0;
@@ -85,22 +81,11 @@ int triangulate(const clone_t *cl, const pt2_t *obs, int n, vector_3d_t *out) {
         mat_t x = mat_mul(mat3_inv(AtA), Atb);
         *out = (vector_3d_t){ x.d[0], x.d[1], x.d[2] };
 
-        /* Cheirality.
-         *
-         * Every plane equation above is homogeneous in (x - c_i), so the
-         * forward ray and its reflection satisfy it equally: the least-squares
-         * solution is free to land behind the cameras, and on MH_01 it does.
-         * Measured 2026-09-18 at t = 19.5-21 s, where the filter's own position
-         * error is 2 cm: every rejected track triangulates to a depth of about
-         * -3.4 m in all nine views, and 100% of window 1's measurement
-         * starvation is these tracks being discarded.
-         *
-         * The two solutions differ by a point reflection through the camera
-         * centres and project identically in every view, so the physical one is
-         * chosen by taking the branch that is in front. The flip is accepted
-         * only when it is in front of *every* camera; otherwise the original
-         * point is returned and the caller rejects it exactly as before, so
-         * this cannot make any track worse. */
+        /* Cheirality. The plane equations are homogeneous in (x - c_i), so the
+         * forward ray and its reflection satisfy them equally and the
+         * least-squares solution can land behind every camera. Take the branch
+         * that is in front when one exists; otherwise return the original so the
+         * caller rejects it as before. */
         vector_3d_t cmean;
         if (count_bad_depths(cl, n, *out, &cmean) > 0) {
                 vector_3d_t flip = { 2.0*cmean.x - out->x,

@@ -5,14 +5,8 @@
 #include "cam.h"
 #include "tri.h"
 
-/* Upper-tail chi-squared quantiles: entry [d-1] is exceeded with probability
- * 0.01 by a chi-squared variable with d degrees of freedom. Named CHI2_95
- * until 2026-09-18 — the name was wrong, the values were always the 99%
- * quantiles, so the designed false-rejection rate was 1%, not 5%. Measured on
- * MH_01: 0.4-2.1% of healthy tracks were rejected, which matches 1% and
- * confirms the values.
- *
- * Now used as the Huber knee rather than as a hard rejection threshold. */
+/* Entry [d-1] is the 99% upper-tail quantile for d degrees of freedom. Used as
+ * the Huber knee. (Was named CHI2_95; the values were always the 99% ones.) */
 static const double CHI2_99[17] = {
         6.635, 9.210, 11.345, 13.277, 15.086, 16.812, 18.475, 20.090, 21.666,
         23.209, 24.725, 26.217, 27.688, 29.141, 30.578, 32.000, 33.409,
@@ -222,30 +216,9 @@ int msckf_update_track(eskf_t *f, const int *ci, const pt2_t *obs, int k, double
         msckf_nis_sum += gamma;
         msckf_nis_dof += (int)m;
 
-        /* Robust (Huber) weighting replaces the hard chi-squared gate.
-         *
-         * A binary gate assumes the model is right. When it is not — the pose
-         * has drifted, so the reprojection residual grows — the gate rejects
-         * the very measurements that would correct the drift, and the error
-         * grows further. Measured on MH_01: 85-90% of submitted tracks were
-         * rejected for 25 s while the track population stayed identical to the
-         * healthy phases.
-         *
-         * So do not reject on residual size; down-weight instead, scaling the
-         * measurement noise up by 1/w with
-         *
-         *     w = sqrt(knee / gamma)   for gamma > knee,   else 1
-         *
-         * the Huber influence function generalised to the Mahalanobis distance
-         * sqrt(gamma). The knee is the quantile the old gate used, so every
-         * track that passed before is bit-identical.
-         *
-         * Influence is bounded: as gamma grows, w -> 0, the s2/w diagonal
-         * dominates S, S^-1 -> 0 and the correction dx -> 0. No second hard
-         * threshold is needed.
-         *
-         * Only the diagonal changes. Entry i of S is s0_i + s2, so
-         * s0_i = S_ii - s2 and the weighted entry is s0_i + s2/w. */
+        /* Huber weight instead of a hard chi-squared gate: a binary gate rejects
+         * the measurements that would fix a growing residual. Only the diagonal
+         * of S changes: s0_i = S_ii - s2, weighted entry s0_i + s2/w. */
         double w = 1.0;
         double knee = CHI2_99[m-1];
         if (gamma > knee) {

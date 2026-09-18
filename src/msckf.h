@@ -18,10 +18,7 @@ typedef struct {
 
 obs_jac_t obs_jacobian(const clone_t *cl, vector_3d_t pf);
 mat_t msckf_nullspace(mat_t Hf);
-/* Rejection-reason counters. Diagnostics only: no estimator path reads these.
- * msckf_update_track() has six exit paths and the caller cannot tell them
- * apart, so a "the gate rejects too much" reading of a rejection count is a
- * guess. That guess was wrong once, at a cost of one 13-minute run. */
+/* Rejection-reason counters. Diagnostics only. */
 enum {
         MSCKF_REJ_K_RANGE = 0,   /* k < 2 or 2k > 40 */
         MSCKF_REJ_TRIANG,        /* triangulate() failed */
@@ -32,18 +29,11 @@ enum {
         MSCKF_REJ_COUNT
 };
 extern int msckf_rej_count[MSCKF_REJ_COUNT];
-/* Diagnostic: observations whose Jacobian was invalid, and observations that
- * were valid, summed over the tracks discarded for that reason. The ratio
- * decides the fix: near 1 invalid of 9 means one bad observation kills an
- * otherwise usable track; near 9 of 9 means the triangulation itself is
- * garbage. */
+/* Observations invalid / valid, summed over the tracks rejected for that reason. */
 extern int msckf_invalid_obs;
 extern int msckf_valid_obs;
-/* Innovation consistency. For a correct measurement noise R, gamma = rp' S^-1 rp
- * is chi-squared with m degrees of freedom, so the mean of gamma/m is 1. A value
- * of 4 means the assumed sigma^2 is 4x too small. This is the principled way to
- * set sigma: it is measured from the filter's own residuals on any sequence,
- * instead of tuned to one. */
+/* gamma = rp' S^-1 rp is chi-squared with m dof when R is correct, so
+ * mean(gamma/m) = 1 calibrates sigma from the filter's own residuals. */
 extern double msckf_nis_sum;
 extern int    msckf_nis_dof;
 

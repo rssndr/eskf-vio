@@ -167,13 +167,8 @@ int main(void) {
         for (int i = 0; i < 6; i++) bad[i] = obs[i];
         bad[2].x += 0.1;
 
-        /* One outlier in six observations. The Huber reweight went in with the
-         * chi-squared gate replacement: the track is accepted and down-weighted
-         * rather than thrown away. So the assertion is no longer "rejected and P
-         * untouched" -- it is the stronger pair: the weight must actually bite,
-         * and the outlier must move the covariance strictly less than the same
-         * update would with clean observations. Two copies of the filter,
-         * identical before the update, make that a direct comparison. */
+        /* One outlier in six: accepted and down-weighted, so it must move P less
+         * than the same update with clean observations. */
         eskf_t fc = f;
         double w = 1.0;
         ret = msckf_update_track(&f, ci, bad, 6, sigma, &w);
