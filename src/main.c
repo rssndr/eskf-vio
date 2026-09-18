@@ -84,7 +84,7 @@ int main(int argc, char *argv[]) {
                 fprintf(diag, "t,frame,pos_err,sigma_1d,sigma_3d,ratio_1d,ratio_3d,"
                               "att_err_deg,n_live,n_dead,n_sub,n_trunc,nobs_sum,nobs_max,"
                               "nobs_all_max,trunc_min,trunc_max,n_clones,ok,rej,ok_frac,n_wtd,w_min,"
-                              "r_k,r_tri,r_jac,r_null,r_chy,r_chi,iobs,vobs\n");
+                              "r_k,r_tri,r_jac,r_null,r_chy,r_chi,iobs,vobs,nis_sum,nis_dof\n");
         else
                 fprintf(stderr, "warning: cannot open %s — diagnostics disabled\n", diag_path);
 
@@ -123,6 +123,8 @@ int main(int argc, char *argv[]) {
                                         rej_before[r] = msckf_rej_count[r];
                                 int iobs_before = msckf_invalid_obs;
                                 int vobs_before = msckf_valid_obs;
+                                double nis_before = msckf_nis_sum;
+                                int dof_before = msckf_nis_dof;
                                 int nobs_sum = 0, nobs_max = 0;
                                 int all_max = 0;         /* longest track offered this frame */
                                 int trunc_min = 0, trunc_max = 0;  /* length range of truncated tracks */
@@ -197,7 +199,7 @@ int main(int argc, char *argv[]) {
                                         int nsub = f_ok + f_rej;
                                         fprintf(diag,
                                                 "%.6f,%zu,%.4f,%.6f,%.6f,%.4f,%.4f,%.4f,"
-                                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d,%.4f,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                                                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d,%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d\n",
                                                 cam[ic].timestamp - imu[i0].timestamp, ic,
                                                 err, s1, s3,
                                                 (s1 > 0.0) ? err / s1 : 0.0,
@@ -216,7 +218,9 @@ int main(int argc, char *argv[]) {
                                                 msckf_rej_count[4] - rej_before[4],
                                                 msckf_rej_count[5] - rej_before[5],
                                                 msckf_invalid_obs - iobs_before,
-                                                msckf_valid_obs - vobs_before);
+                                                msckf_valid_obs - vobs_before,
+                                                msckf_nis_sum - nis_before,
+                                                msckf_nis_dof - dof_before);
                                 }
                                 image_free(&img);
                         }
@@ -242,6 +246,14 @@ int main(int argc, char *argv[]) {
                sqrt(mat_get(f.P, 0, 0)));
         printf("att 1-sigma: %.3f deg\n", sqrt(mat_get(f.P, 6, 6)) * 180.0 / M_PI);
         printf("updates: %d ok, %d rejected\n", updates_ok, updates_rej);
+        /* gamma is chi-squared with m degrees of freedom when R is right, so a
+         * mean of 1 means the noise model is calibrated and 4 means sigma^2 is
+         * four times too small. */
+        if (msckf_nis_dof)
+                printf("NIS: mean gamma/dof = %.3f   mean gamma = %.1f   (%d dof, %d tracks)\n",
+                       msckf_nis_sum / msckf_nis_dof,
+                       msckf_nis_sum / (updates_ok ? updates_ok : 1),
+                       msckf_nis_dof, updates_ok);
 
         double t_wall = now_s() - t_wall0;
         /* Span actually processed, not the span of the dataset: with the stop

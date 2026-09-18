@@ -39,6 +39,13 @@ extern int msckf_rej_count[MSCKF_REJ_COUNT];
  * garbage. */
 extern int msckf_invalid_obs;
 extern int msckf_valid_obs;
+/* Innovation consistency. For a correct measurement noise R, gamma = rp' S^-1 rp
+ * is chi-squared with m degrees of freedom, so the mean of gamma/m is 1. A value
+ * of 4 means the assumed sigma^2 is 4x too small. This is the principled way to
+ * set sigma: it is measured from the filter's own residuals on any sequence,
+ * instead of tuned to one. */
+extern double msckf_nis_sum;
+extern int    msckf_nis_dof;
 
 /* w_out (may be NULL) receives the Huber weight applied to this track: 1.0
  * when the residual is inside the knee, sqrt(knee/gamma) below it. */

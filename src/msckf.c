@@ -21,6 +21,8 @@ static const double CHI2_99[17] = {
 int msckf_rej_count[MSCKF_REJ_COUNT];
 int msckf_invalid_obs;
 int msckf_valid_obs;
+double msckf_nis_sum;
+int    msckf_nis_dof;
 
 extern mat_t quat_to_R(quaternion_t q);
 extern mat_t mat_skew(vector_3d_t v);
@@ -215,6 +217,10 @@ int msckf_update_track(eskf_t *f, const int *ci, const pt2_t *obs, int k, double
         if (!mat_chol_solve(S, rp, &y)) { msckf_rej_count[MSCKF_REJ_CHOL_Y]++; return 0; }
         double gamma = 0;
         for (size_t i = 0; i < m; i++) gamma += rp.d[i] * y.d[i];
+        /* Raw innovation statistic, before any weighting: mean gamma/m should be
+         * 1 when R is right, and is the estimator for the sigma correction. */
+        msckf_nis_sum += gamma;
+        msckf_nis_dof += (int)m;
 
         /* Robust (Huber) weighting replaces the hard chi-squared gate.
          *
