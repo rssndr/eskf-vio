@@ -1,12 +1,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
 #include "euroc.h"
 #include "quat.h"
 #include "eskf.h"
 #include "image.h"
 #include "frontend.h"
 #include "msckf.h"
+
+/* Monotonic wall clock for the stage timing report. Diagnostic only: nothing
+ * downstream reads it, so the estimator's numbers stay bit-identical. */
+static double now_s(void) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
 
 static size_t gt_nearest(const gt_sample_t *gt, size_t n, double t) {
         for (size_t i = 0; i < n; i++)
@@ -64,6 +73,11 @@ int main(int argc, char *argv[]) {
          * most questions in a quarter of the time. The estimator path is
          * untouched; the same frames produce the same numbers. */
         double t_end = (argc >= 6) ? atof(argv[5]) : 0.0;
+        /* Optional 6th argument: measurement noise in pixels (default 3.0).
+         * Expressed against the focal length to get normalized units, which is
+         * what the filter wants. Exposed so the noise model can be swept
+         * against the overconfidence ratio instead of being assumed. */
+        double sigma_px = (argc >= 7) ? atof(argv[6]) : 3.0;
         int stop = 0;
         FILE *diag = fopen(diag_path, "w");
         if (diag)
@@ -76,15 +90,28 @@ int main(int argc, char *argv[]) {
 
         printf("%-8s %-12s %-12s %-10s\n", "t [s]", "pos err [m]", "pred +- [m]", "att err [deg]");
 
+        /* Stage timing. Answers "what do I optimise" with a measurement instead
+         * of arithmetic: how much of the run is the MSCKF update, and how much
+         * is the front-end. RT frac is that stage's total divided by the flight
+         * duration, so a value above 1.00 means the stage alone is slower than
+         * real time. */
+        double t_prop = 0.0, t_front = 0.0, t_upd = 0.0;
+        size_t k_last = i0;   /* last IMU sample processed, for the true span */
+        double t_wall0 = now_s();
+
         for (size_t k = i0; k < n-1 && !stop; k++) {
+                k_last = k;
                 double dt = imu[k+1].timestamp - imu[k].timestamp;
+                double tp0 = now_s();
                 eskf_predict(&f, imu[k], dt);
+                t_prop += now_s() - tp0;
 
                 if (ic < ncam && cam[ic].timestamp <= imu[k+1].timestamp) {
                         if (t_end > 0.0 && cam[ic].timestamp - imu[i0].timestamp > t_end) {
                                 stop = 1;
                                 break;
                         }
+                        double tf0 = now_s();
                         snprintf(path, sizeof path, "%s/data/%s", cam_dir, cam[ic].filename);
                         image_t img;
                         if (image_load(path, &img) == 0) {
@@ -102,6 +129,8 @@ int main(int argc, char *argv[]) {
 
                                 eskf_augment(&f, cam[ic].timestamp);
                                 frontend_process(&fe, &img);
+                                double tf1 = now_s();
+                                t_front += tf1 - tf0;
 
                                 for (int d = 0; d < fe.n_dead; d++) {
                                         dead_track_t *tk = &fe.dead[d];
@@ -139,7 +168,7 @@ int main(int argc, char *argv[]) {
                                         nobs_sum += ks;
                                         if (ks > nobs_max) nobs_max = ks;
                                         double w = 1.0;
-                                        if (msckf_update_track(&f, ci, tk->obs + off, ks, 3.0/458.0, &w)) {
+                                        if (msckf_update_track(&f, ci, tk->obs + off, ks, sigma_px/458.0, &w)) {
                                                 updates_ok++;
                                                 f_ok++;
                                         } else {
@@ -151,6 +180,7 @@ int main(int argc, char *argv[]) {
                                                 if (w < w_min) w_min = w;
                                         }
                                 }
+                                t_upd += now_s() - tf1;
 
                                 if (diag) {
                                         gt_sample_t *gd = &gt[gt_nearest(gt, m, cam[ic].timestamp)];
@@ -212,6 +242,22 @@ int main(int argc, char *argv[]) {
                sqrt(mat_get(f.P, 0, 0)));
         printf("att 1-sigma: %.3f deg\n", sqrt(mat_get(f.P, 6, 6)) * 180.0 / M_PI);
         printf("updates: %d ok, %d rejected\n", updates_ok, updates_rej);
+
+        double t_wall = now_s() - t_wall0;
+        /* Span actually processed, not the span of the dataset: with the stop
+         * option these differ, and dividing by the dataset length silently
+         * halves every RT frac. */
+        double t_flight = imu[k_last].timestamp - imu[i0].timestamp;
+        double t_acc = t_prop + t_front + t_upd;
+        printf("\nstage timing (one thread, this machine — not the P4)\n");
+        printf("%-10s %11s %8s %9s\n", "stage", "total [s]", "% run", "RT frac");
+        printf("%-10s %11.1f %7.1f%% %9.2f\n", "predict",   t_prop,  100*t_prop/t_wall,  t_prop/t_flight);
+        printf("%-10s %11.1f %7.1f%% %9.2f\n", "front-end", t_front, 100*t_front/t_wall, t_front/t_flight);
+        printf("%-10s %11.1f %7.1f%% %9.2f\n", "update",    t_upd,   100*t_upd/t_wall,   t_upd/t_flight);
+        printf("%-10s %11.1f %7.1f%% %9.2f\n", "accounted", t_acc,   100*t_acc/t_wall,   t_acc/t_flight);
+        printf("%-10s %11.1f %7.1f%% %9.2f\n", "wall",      t_wall,  100.0,              t_wall/t_flight);
+        printf("flight %.1f s over %zu frames -> %.0f ms/frame, %.0f ms of it update\n",
+               t_flight, ic, 1000.0*t_wall/(ic ? ic : 1), 1000.0*t_upd/(ic ? ic : 1));
         printf("gyro bias est %.5f %.5f %.5f | true %.5f %.5f %.5f\n",
                f.bg.x, f.bg.y, f.bg.z,
                gt[m-1].gyro_bias.x, gt[m-1].gyro_bias.y, gt[m-1].gyro_bias.z);
