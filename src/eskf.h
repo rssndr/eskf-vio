@@ -6,6 +6,13 @@
 
 #define MAX_CLONES 10
 
+/* SIG_A is not the datasheet value: inflated to cover unmodelled error sources.
+ * The others are the ADIS16448 datasheet densities. */
+#define SIG_A   1.0000e-2
+#define SIG_G   1.6968e-4
+#define SIG_BA  3.0000e-3
+#define SIG_BG  1.9393e-5
+
 typedef struct {
         quaternion_t q;
         vector_3d_t  pos;

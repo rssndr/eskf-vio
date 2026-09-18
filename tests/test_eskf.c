@@ -78,9 +78,11 @@ int main(void) {
                         rot &= fabs(mat_get(BtB,i,j) - (i==j?1.0:0.0)) < 1e-9;
         check("F: (2,2) is a rotation at w!=0", rot);
 
-        mat_t Q = build_Q(0.005);
-        check("Q: vel entry = sig_a^2*dt",  fabs(mat_get(Q,3,3) - 2.0e-3*2.0e-3*0.005) < 1e-20);
-        check("Q: pos block empty",         mat_get(Q,0,0) == 0.0);
+        mat_t Q  = build_Q(0.005);
+        mat_t Q2 = build_Q(0.010);
+        check("Q: vel variance is sigma_a^2*dt", fabs(mat_get(Q,3,3) - SIG_A*SIG_A*0.005) < 1e-20);
+        check("Q: vel variance scales with dt",  fabs(mat_get(Q2,3,3) - 2.0*mat_get(Q,3,3)) < 1e-20);
+        check("Q: pos block empty",              mat_get(Q,0,0) == 0.0);
 
         eskf_t f;
         vector_3d_t zero = {0,0,0};

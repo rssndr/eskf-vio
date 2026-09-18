@@ -4,11 +4,6 @@
 
 enum { POS = 0, VEL = 3, TH = 6, BA = 9, BG = 12 };
 
-#define SIG_A   2.0000e-3
-#define SIG_G   1.6968e-4
-#define SIG_BA  3.0000e-3
-#define SIG_BG  1.9393e-5
-
 mat_t mat_skew(vector_3d_t a) {
         mat_t M = mat_zero(3, 3);
         mat_set(&M, 0, 1, -a.z);

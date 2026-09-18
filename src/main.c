@@ -197,7 +197,8 @@ int main(int argc, char *argv[]) {
         /* argv[4] = CSV path, argv[5] = stop [s], argv[6] = measurement sigma [px] */
         const char *diag_path = (argc >= 5) ? argv[4] : "diag.csv";
         double t_end = (argc >= 6) ? atof(argv[5]) : 0.0;
-        double sigma_px = (argc >= 7) ? atof(argv[6]) : 3.0;
+        /* 0.65 px: the NIS-calibrated tracker sigma, confirmed three ways. */
+        double sigma_px = (argc >= 7) ? atof(argv[6]) : 0.65;
         /* Accelerometer as a gravity-direction measurement; off by default
          * (trusting it degrades the estimate — see eskf.c). */
         double grav_gate  = (argc >= 8) ? atof(argv[7]) : 0.0;
