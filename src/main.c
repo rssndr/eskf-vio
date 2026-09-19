@@ -22,9 +22,7 @@ static size_t gt_nearest(const gt_sample_t *gt, size_t n, double t) {
         return n - 1;
 }
 
-/* Observability diagnostic. Projects P onto the four directions a monocular
- * VIO cannot observe -- the three global translations, and yaw about gravity --
- * so the value can only grow, never fall. */
+/* Project P onto the four unobservable directions; the value can only grow. */
 static void R_row2(const quaternion_t *q, double out[3]) {
         out[0] = 2.0 * (q->x*q->z - q->y*q->w);
         out[1] = 2.0 * (q->y*q->z + q->x*q->w);
@@ -111,8 +109,7 @@ static void att_err_vec(const quaternion_t *qf, const quaternion_t *qt, double d
         dth[2] = th * (R[3] - R[1]) / s;
 }
 
-/* Angle between the two body-z axes in the world frame: the tilt error that
- * leaks gravity into the horizontal plane. */
+/* Angle between the two body-z axes in the world frame: tilt error leaking into gravity. */
 static double tilt_deg(const quaternion_t *qf, const quaternion_t *qt) {
         double d = 0.0;
         for (int k = 0; k < 3; k++)
@@ -123,9 +120,14 @@ static double tilt_deg(const quaternion_t *qf, const quaternion_t *qt) {
         return acos(d) * 180.0 / M_PI;
 }
 
-/* Cholesky on P, returning the smallest pivot: negative means P is not positive
- * definite. With sym set, factor 0.5*(P + P') instead, to separate a genuinely
- * indefinite covariance from the asymmetry that (I - K H) P introduces. */
+/* acos(fabs(dot)) sees dot > 1 by rounding and returns nan; clamp. */
+static double quat_ang_deg(const quaternion_t *a, const quaternion_t *b) {
+        double d = fabs(a->w*b->w + a->x*b->x + a->y*b->y + a->z*b->z);
+        if (d > 1.0) d = 1.0;
+        return 2.0 * acos(d) * 180.0 / M_PI;
+}
+
+/* Smallest Cholesky pivot of P; negative means not positive definite. sym=1 uses 0.5*(P+P'). */
 static double Pchol[MAT_MAX*MAT_MAX];
 static double chol_min_pivot(const eskf_t *f, int sym) {
         size_t d = state_dim(f), st = f->P.cols;
@@ -177,6 +179,16 @@ int main(int argc, char *argv[]) {
         size_t ncam = euroc_load_cam(path, &cam);
         if (ncam == 0) return 1;
 
+        /* argv[11] = keep every decim-th camera frame; compact here, loop unchanged. */
+        int decim = (argc >= 12) ? atoi(argv[11]) : 1;
+        if (decim < 1) decim = 1;
+        if (decim > 1) {
+                size_t w = 0;
+                for (size_t i = 0; i < ncam; i += (size_t)decim)
+                        cam[w++] = cam[i];
+                ncam = w;
+        }
+
         size_t i0 = 0;
         while (i0 < n && imu[i0].timestamp < gt[0].timestamp)
                 i0++;
@@ -185,6 +197,8 @@ int main(int argc, char *argv[]) {
 
         eskf_t f;
         eskf_init(&f, gt[j0].q, gt[j0].pos, gt[j0].vel, gt[0].accel_bias, gt[0].gyro_bias);
+        /* argv[12] = clone-window duration cap [s]; 0 keeps the fixed count. */
+        f.max_span = (argc >= 13) ? atof(argv[12]) : 0.0;
 
         frontend_t fe;
         frontend_init(&fe);
@@ -199,16 +213,12 @@ int main(int argc, char *argv[]) {
         double t_end = (argc >= 6) ? atof(argv[5]) : 0.0;
         /* 0.65 px: the NIS-calibrated tracker sigma, confirmed three ways. */
         double sigma_px = (argc >= 7) ? atof(argv[6]) : 0.65;
-        /* Accelerometer as a gravity-direction measurement; off by default
-         * (trusting it degrades the estimate — see eskf.c). */
+        /* Accelerometer as a gravity measurement; measured to degrade the estimate, off by default. */
         double grav_gate  = (argc >= 8) ? atof(argv[7]) : 0.0;
         double grav_sigma = (argc >= 9) ? atof(argv[8]) : 0.5;
-        /* Zero-velocity update while no linear acceleration is sustained. The
-         * detector runs at the IMU rate; |a| within 0.2 m/s^2 of g for 200
-         * consecutive samples (1 s) counts as stationary. 0 disables. */
+        /* Zero-velocity update: stationary = |a| within 0.2 m/s^2 of g for 1 s; 0 disables. */
         double zupt_sigma = (argc >= 10) ? atof(argv[9]) : 0.05;
-        /* Hold the velocity at its value when the quiet stretch began, instead
-         * of zeroing it: the strict consequence of delta v = 0. 0 disables. */
+        /* Hold velocity at its value when the quiet stretch began; the stricter, weaker variant. */
         double hold_sigma = (argc >= 11) ? atof(argv[10]) : 0.0;
         vector_3d_t v_ref = { 0.0, 0.0, 0.0 };
         int grav_ok = 0, zupt_ok = 0, hold_ok = 0, quiet_n = 0;
@@ -222,21 +232,19 @@ int main(int argc, char *argv[]) {
                               "var_tx,var_ty,var_tz,var_yaw,"
                               "errx,erry,errz,verrx,verry,verrz,"
                               "dthx,dthy,dthz,tilt_deg,asym,piv_raw,piv_sym,qw,qx,qy,qz,"
-                              "vprex,vprey,vprez,bax,bay,baz,bgx,bgy,bgz,svel,satt\n");
+                              "vprex,vprey,vprez,bax,bay,baz,bgx,bgy,bgz,svel,satt,"
+                              "span,base,n_in,fb_rms,disp\n");
         else
                 fprintf(stderr, "warning: cannot open %s — diagnostics disabled\n", diag_path);
 
         printf("%-8s %-12s %-12s %-10s\n", "t [s]", "pos err [m]", "pred +- [m]", "att err [deg]");
 
-        /* Stage timing. RT frac > 1.00 means that stage alone is slower than
-         * real time. */
+        /* Stage timing. RT frac > 1.00 means that stage alone is slower than real time. */
         double t_prop = 0.0, t_front = 0.0, t_upd = 0.0;
         size_t k_last = i0;   /* last IMU sample processed, for the true span */
         double t_wall0 = now_s();
 
-        /* Observability diagnostic: index 0-2 = translation x/y/z, 3 = yaw.
-         * The direction is an average over the clone set, so its weights change
-         * when the window resizes -- compare only frames with the same count. */
+        /* Observability diagnostic: 0-2 translation xyz, 3 yaw; compare equal clone counts only. */
         double ndir[MAT_MAX];
         int psd_fail = 0, psd_fail_sym = 0, have_pmin = 0;
         double asym_max = 0.0, piv_raw_min = 1e300, piv_sym_min = 1e300;
@@ -325,12 +333,7 @@ int main(int argc, char *argv[]) {
                                         int kk = tk->nobs;
                                         if (kk > all_max) all_max = kk;
 
-                                        /* Pair by frame: a dead track's newest
-                                         * observation is frame F-1 while clone
-                                         * n_clones-1 is frame F, so
-                                         * ci[j] = n_clones-1-ks+j and the usable
-                                         * window is n_clones-1. Truncate the oldest
-                                         * observations; do not discard the track. */
+                                        /* Pair by frame: the usable window is n_clones-1; truncate the oldest, keep the track. */
                                         int kmax = f.n_clones - 1;
                                         int ks   = (kk > kmax) ? kmax : kk;
                                         int off  = kk - ks;
@@ -403,8 +406,6 @@ int main(int argc, char *argv[]) {
                                         double s3 = sqrt(mat_get(f.P, 0, 0) +
                                                          mat_get(f.P, 1, 1) +
                                                          mat_get(f.P, 2, 2));
-                                        double dot = f.q.w*gd->q.w + f.q.x*gd->q.x +
-                                                     f.q.y*gd->q.y + f.q.z*gd->q.z;
                                         int nsub = f_ok + f_rej;
                                         double verr[3] = { f.vel.x - gd->vel.x,
                                                            f.vel.y - gd->vel.y,
@@ -415,6 +416,17 @@ int main(int argc, char *argv[]) {
                                         double asym = p_asym(&f);
                                         double piv_raw = chol_min_pivot(&f, 0);
                                         double piv_sym = chol_min_pivot(&f, 1);
+                                        /* Clone-window geometry: span and baseline. */
+                                        double span = 0.0, base = 0.0;
+                                        if (f.n_clones >= 2) {
+                                                clone_t *c0 = &f.clones[0];
+                                                clone_t *c1 = &f.clones[f.n_clones - 1];
+                                                double bx = c1->pos.x - c0->pos.x;
+                                                double by = c1->pos.y - c0->pos.y;
+                                                double bz = c1->pos.z - c0->pos.z;
+                                                base = sqrt(bx*bx + by*by + bz*bz);
+                                                span = c1->timestamp - c0->timestamp;
+                                        }
                                         if (piv_raw < 0.0) psd_fail++;
                                         if (piv_sym < 0.0) psd_fail_sym++;
                                         if (asym > asym_max) asym_max = asym;
@@ -430,12 +442,12 @@ int main(int argc, char *argv[]) {
                                                 "%.8f,%.8f,%.8f,%.8f,"
                                                 "%.6f,%.6f,%.6f,"
                                                 "%.6e,%.6e,%.6e,%.6e,%.6e,%.6e,"
-                                                "%.6f,%.6f\n",
+                                                "%.6f,%.6f,%.4f,%.6e,%d,%.6e,%.4f\n",
                                                 cam[ic].timestamp - imu[i0].timestamp, ic,
                                                 err, s1, s3,
                                                 (s1 > 0.0) ? err / s1 : 0.0,
                                                 (s3 > 0.0) ? err / s3 : 0.0,
-                                                2.0 * acos(fabs(dot)) * 180.0 / M_PI,
+                                                quat_ang_deg(&f.q, &gd->q),
                                                 fe.n, fe.n_dead, f_sub, f_trunc,
                                                 nobs_sum, nobs_max,
                                                 all_max, trunc_min, trunc_max, f.n_clones,
@@ -462,7 +474,8 @@ int main(int argc, char *argv[]) {
                                                 f.ba.x, f.ba.y, f.ba.z,
                                                 f.bg.x, f.bg.y, f.bg.z,
                                                 sqrt(mat_get(f.P, 3, 3) + mat_get(f.P, 4, 4) + mat_get(f.P, 5, 5)),
-                                                sqrt(mat_get(f.P, 6, 6) + mat_get(f.P, 7, 7) + mat_get(f.P, 8, 8)));
+                                                sqrt(mat_get(f.P, 6, 6) + mat_get(f.P, 7, 7) + mat_get(f.P, 8, 8)),
+                                                span, base, fe.n_in, fe.fb_rms, fe.disp);
                                 }
                                 image_free(&img);
                         }
@@ -472,12 +485,11 @@ int main(int argc, char *argv[]) {
                 if ((k - i0) % 4000 == 0) {
                         gt_sample_t *g = &gt[gt_nearest(gt, m, imu[k].timestamp)];
                         double dx = f.pos.x - g->pos.x, dy = f.pos.y - g->pos.y, dz = f.pos.z - g->pos.z;
-                        double dot = f.q.w*g->q.w + f.q.x*g->q.x + f.q.y*g->q.y + f.q.z*g->q.z;
                         printf("%-8.1f %-12.2f %-12.2f %-10.2f\n",
                                imu[k].timestamp - imu[i0].timestamp,
                                sqrt(dx*dx + dy*dy + dz*dz),
                                sqrt(mat_get(f.P, 0, 0)),
-                               2.0 * acos(fabs(dot)) * 180.0 / M_PI);
+                               quat_ang_deg(&f.q, &g->q));
                 }
         }
 
@@ -488,18 +500,14 @@ int main(int argc, char *argv[]) {
                sqrt(mat_get(f.P, 0, 0)));
         printf("att 1-sigma: %.3f deg\n", sqrt(mat_get(f.P, 6, 6)) * 180.0 / M_PI);
         printf("updates: %d ok, %d rejected\n", updates_ok, updates_rej);
-        /* gamma is chi-squared with m degrees of freedom when R is right, so a
-         * mean of 1 means the noise model is calibrated and 4 means sigma^2 is
-         * four times too small. */
+        /* gamma is chi-squared with m dof when R is right: mean 1 = calibrated, 4 = sigma^2 4x small. */
         if (msckf_nis_dof)
                 printf("NIS: mean gamma/dof = %.3f   mean gamma = %.1f   (%d dof, %d tracks)\n",
                        msckf_nis_sum / msckf_nis_dof,
                        msckf_nis_sum / (updates_ok ? updates_ok : 1),
                        msckf_nis_dof, updates_ok);
 
-        /* A correct filter gains no information along these directions, so every
-         * fall is information it cannot have. Only frames with the same clone
-         * count are compared. */
+        /* No information is gainable along these directions; compare equal clone counts only. */
         if (have_full) {
                 static const char *nm[4] = { "translation x", "translation y",
                                              "translation z", "yaw about z" };
@@ -530,9 +538,7 @@ int main(int argc, char *argv[]) {
                hold_ok, hold_sigma);
 
         double t_wall = now_s() - t_wall0;
-        /* Span actually processed, not the span of the dataset: with the stop
-         * option these differ, and dividing by the dataset length silently
-         * halves every RT frac. */
+        /* Span actually processed, not the dataset length - they differ under the stop option. */
         double t_flight = imu[k_last].timestamp - imu[i0].timestamp;
         double t_acc = t_prop + t_front + t_upd;
         printf("\nstage timing (one thread, this machine — not the P4)\n");

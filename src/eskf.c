@@ -79,6 +79,7 @@ void eskf_init(eskf_t *f, quaternion_t q, vector_3d_t pos, vector_3d_t vel,
                vector_3d_t ba, vector_3d_t bg) {
         f->q = q;  f->pos = pos;  f->vel = vel;  f->ba = ba;  f->bg = bg;
         f->n_clones = 0;
+        f->max_span = 0.0;
         f->P = mat_zero(15, 15);
         for (size_t i = POS; i < TH+3; i++)  mat_set(&f->P, i, i, 1e-5);
         for (size_t i = BA;  i < BA+3; i++)  mat_set(&f->P, i, i, 1e-6);
@@ -131,10 +132,7 @@ void eskf_inject(eskf_t *f, const mat_t *dx) {
         }
 }
 
-/* Accelerometer as a gravity-direction measurement. At rest the specific force
- * is -g expressed in the body frame, so the predicted measurement is 9.81 * R'
- * e_z. Gated on | |a| - g | < gate, because under real acceleration the
- * accelerometer is not measuring gravity. Returns 1 if the update was applied. */
+/* Accelerometer as a gravity measurement: 9.81 * R' e_z, gated on | |a| - g |. */
 int eskf_update_gravity(eskf_t *f, vector_3d_t a_m, double gate, double sigma_a) {
         double am = sqrt(a_m.x*a_m.x + a_m.y*a_m.y + a_m.z*a_m.z);
         if (gate <= 0.0 || fabs(am - 9.81) > gate)
@@ -211,11 +209,7 @@ int eskf_update_gravity(eskf_t *f, vector_3d_t a_m, double gate, double sigma_a)
         return 1;
 }
 
-/* Velocity measurement against a reference, H on the velocity block only. With
- * v_ref = 0 this is a zero-velocity update. With v_ref = the velocity at the
- * start of a no-linear-acceleration stretch it is the weaker and stricter
- * statement the accelerometer actually supports: delta v = 0, velocity only
- * held, not zeroed. */
+/* Velocity against a reference, H on the velocity block only; v_ref = 0 is a ZUPT. */
 int eskf_update_vel(eskf_t *f, vector_3d_t v_ref, double sigma_v) {
         size_t n = 15 + 6 * (size_t)f->n_clones, st = f->P.cols;
         if (sigma_v <= 0.0)
@@ -332,7 +326,11 @@ static void marginalize_oldest(eskf_t *f) {
 }
 
 void eskf_augment(eskf_t *f, double timestamp) {
-        if (f->n_clones == MAX_CLONES)
+        /* Optional duration cap: without it the window spans more time at lower rates. */
+        while (f->n_clones > 0 &&
+               (f->n_clones >= MAX_CLONES ||
+                (f->max_span > 0.0 && f->n_clones > 2 &&
+                 timestamp - f->clones[0].timestamp > f->max_span)))
                 marginalize_oldest(f);
 
         size_t d = 15 + 6 * (size_t)f->n_clones;

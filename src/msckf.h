@@ -9,10 +9,7 @@ typedef struct {
         double Hf[6];
         pt2_t  z;
         int    valid;
-        /* Camera-frame depth of the point in this clone's frame. Always set,
-         * valid or not, so a caller can tell "behind the camera" (negative)
-         * from "on the lens" (small positive) from "off the top of the
-         * frustum". */
+        /* Depth in this clone's frame; always set, so negative means behind the camera. */
         double depth;
 } obs_jac_t;
 
@@ -32,13 +29,11 @@ extern int msckf_rej_count[MSCKF_REJ_COUNT];
 /* Observations invalid / valid, summed over the tracks rejected for that reason. */
 extern int msckf_invalid_obs;
 extern int msckf_valid_obs;
-/* gamma = rp' S^-1 rp is chi-squared with m dof when R is correct, so
- * mean(gamma/m) = 1 calibrates sigma from the filter's own residuals. */
+/* gamma = rp' S^-1 rp is chi-squared with m dof when R is correct. */
 extern double msckf_nis_sum;
 extern int    msckf_nis_dof;
 
-/* w_out (may be NULL) receives the Huber weight applied to this track: 1.0
- * when the residual is inside the knee, sqrt(knee/gamma) below it. */
+/* w_out (may be NULL) receives the Huber weight applied to this track. */
 int msckf_update_track(eskf_t *f, const int *ci, const pt2_t *obs, int k, double sigma,
                        double *w_out);
 

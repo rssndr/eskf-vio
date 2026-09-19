@@ -27,6 +27,9 @@ typedef struct {
         int next_id;
         dead_track_t dead[FE_MAX];
         int n_dead;
+        int n_in;        /* features offered to the tracker this frame */
+        double fb_rms;   /* RMS forward-backward error, px */
+        double disp;     /* mean pixel motion of the features that survived */
 } frontend_t;
 
 void frontend_init(frontend_t *fe);

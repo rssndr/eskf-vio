@@ -5,8 +5,7 @@
 #include "cam.h"
 #include "tri.h"
 
-/* Entry [d-1] is the 99% upper-tail quantile for d degrees of freedom. Used as
- * the Huber knee. (Was named CHI2_95; the values were always the 99% ones.) */
+/* Entry [d-1] is the 99% upper-tail quantile for d dof; the Huber knee. */
 static const double CHI2_99[17] = {
         6.635, 9.210, 11.345, 13.277, 15.086, 16.812, 18.475, 20.090, 21.666,
         23.209, 24.725, 26.217, 27.688, 29.141, 30.578, 32.000, 33.409,
@@ -131,11 +130,25 @@ mat_t msckf_nullspace(mat_t Hf) {
         return A;
 }
 
+/* Dump for tools/xcheck.py, which recomputes the projection and update in numpy. */
+static void xc_dump(const char *tag, const mat_t *M) {
+        printf("%s %zu %zu", tag, M->rows, M->cols);
+        for (size_t i = 0; i < M->rows; i++)
+                for (size_t j = 0; j < M->cols; j++)
+                        printf(" %.17g", M->d[i * M->cols + j]);
+        printf("\n");
+}
+
 int msckf_update_track(eskf_t *f, const int *ci, const pt2_t *obs, int k, double sigma, double *w_out) {
-        /* Weight actually applied to this track: 1.0 when the residual is
-         * inside the knee. Reported as 1.0 on every early return so the caller
-         * never reads a stale value. */
+        /* Huber weight applied; 1.0 on every early return so the caller never reads a stale value. */
         if (w_out) *w_out = 1.0;
+        static int xc_left = -1;
+        static mat_t P0xc;
+        if (xc_left < 0) {
+                const char *e = getenv("MSCKF_XCHECK");
+                xc_left = e ? atoi(e) : 0;
+        }
+        if (xc_left > 0) P0xc = f->P;
         if (k < 2 || 2*k > 40) { msckf_rej_count[MSCKF_REJ_K_RANGE]++; return 0; }
         size_t n = 15 + 6 * (size_t)f->n_clones;
 
@@ -152,10 +165,7 @@ int msckf_update_track(eskf_t *f, const int *ci, const pt2_t *obs, int k, double
         for (int i = 0; i < k; i++) {
                 obs_jac_t o = obs_jacobian(&f->clones[ci[i]], pf);
                 if (!o.valid) {
-                        /* Diagnostic only: keep scanning so the counters can
-                         * say how many observations of this track were
-                         * unusable. The track is still discarded exactly as
-                         * before — row i is simply left at zero. */
+                        /* Diagnostic only: keep scanning to count unusable observations; discard as before. */
                         n_invalid++;
                         continue;
                 }
@@ -173,9 +183,7 @@ int msckf_update_track(eskf_t *f, const int *ci, const pt2_t *obs, int k, double
                 msckf_rej_count[MSCKF_REJ_JACOBIAN]++;
                 msckf_invalid_obs += n_invalid;
                 msckf_valid_obs   += k - n_invalid;
-                /* MSCKF_DUMP=<n> prints the observations and clone positions of
-                 * the first n tracks discarded this way, then stops. Diagnostic
-                 * only; unset means no cost beyond one getenv. */
+                /* MSCKF_DUMP=<n> dumps the first n discarded tracks; unset costs one getenv. */
                 static int dump_left = -1;
                 if (dump_left < 0) {
                         const char *e = getenv("MSCKF_DUMP");
@@ -211,14 +219,11 @@ int msckf_update_track(eskf_t *f, const int *ci, const pt2_t *obs, int k, double
         if (!mat_chol_solve(S, rp, &y)) { msckf_rej_count[MSCKF_REJ_CHOL_Y]++; return 0; }
         double gamma = 0;
         for (size_t i = 0; i < m; i++) gamma += rp.d[i] * y.d[i];
-        /* Raw innovation statistic, before any weighting: mean gamma/m should be
-         * 1 when R is right, and is the estimator for the sigma correction. */
+        /* Raw innovation statistic, before weighting: mean gamma/m is 1 when R is right. */
         msckf_nis_sum += gamma;
         msckf_nis_dof += (int)m;
 
-        /* Huber weight instead of a hard chi-squared gate: a binary gate rejects
-         * the measurements that would fix a growing residual. Only the diagonal
-         * of S changes: s0_i = S_ii - s2, weighted entry s0_i + s2/w. */
+        /* Huber replaces the binary gate, which rejects what would fix the residual. */
         double w = 1.0;
         double knee = CHI2_99[m-1];
         if (gamma > knee) {
@@ -236,6 +241,17 @@ int msckf_update_track(eskf_t *f, const int *ci, const pt2_t *obs, int k, double
         mat_t KH  = mat_mul(K, Hp);
         f->P = mat_mul(mat_add(mat_eye(n), mat_scale(KH, -1.0)), f->P);
         eskf_inject(f, &dx);
+        if (xc_left > 0) {
+                xc_left--;
+                printf("XC k=%d n=%zu m=%zu sigma=%.17g gamma=%.17g w=%.17g\n",
+                       k, n, m, sigma, gamma, w);
+                xc_dump("R", &r);
+                xc_dump("HX", &Hx);
+                xc_dump("HF", &Hf);
+                xc_dump("P0", &P0xc);
+                xc_dump("DX", &dx);
+                xc_dump("P1", &f->P);
+        }
         return 1;
 }
 

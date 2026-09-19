@@ -1,8 +1,11 @@
 # Makefile
 CC      = gcc
-CFLAGS = -Wall -Wextra -O2 -Isrc -Ithird_party
+# -include at the end of this file can supply a default goal; pin it.
+.DEFAULT_GOAL := all
+# -MMD -MP: per-object header deps, so a header change rebuilds its users.
+CFLAGS = -Wall -Wextra -O2 -Isrc -Ithird_party -MMD -MP
 ifdef DEBUG
-CFLAGS = -Wall -Wextra -g -O0 -Isrc -Ithird_party
+CFLAGS = -Wall -Wextra -g -O0 -Isrc -Ithird_party -MMD -MP
 endif
 LIBS    = -lm
 
@@ -20,6 +23,9 @@ MOD_OBJS  = $(filter-out build/main.o,$(OBJS))
 # Tests: every tests/*.c becomes its own binary build/test_*
 TEST_SRCS = $(wildcard tests/*.c)
 TEST_BINS = $(patsubst tests/%.c,build/%,$(TEST_SRCS))
+
+# Header deps from -MMD. Must be included at the END of this file.
+DEPS = $(OBJS:.o=.d) $(TEST_BINS:=.d)
 
 all: build/main
 
@@ -45,4 +51,6 @@ clean:
 	rm -rf build
 
 .PHONY: all test run clean
+
+-include $(DEPS)
 

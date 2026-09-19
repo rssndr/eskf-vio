@@ -81,11 +81,7 @@ int triangulate(const clone_t *cl, const pt2_t *obs, int n, vector_3d_t *out) {
         mat_t x = mat_mul(mat3_inv(AtA), Atb);
         *out = (vector_3d_t){ x.d[0], x.d[1], x.d[2] };
 
-        /* Cheirality. The plane equations are homogeneous in (x - c_i), so the
-         * forward ray and its reflection satisfy them equally and the
-         * least-squares solution can land behind every camera. Take the branch
-         * that is in front when one exists; otherwise return the original so the
-         * caller rejects it as before. */
+        /* Homogeneous in (x - c_i): take the in-front branch if one exists, else return as-is. */
         vector_3d_t cmean;
         if (count_bad_depths(cl, n, *out, &cmean) > 0) {
                 vector_3d_t flip = { 2.0*cmean.x - out->x,

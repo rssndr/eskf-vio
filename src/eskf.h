@@ -6,8 +6,7 @@
 
 #define MAX_CLONES 10
 
-/* SIG_A is not the datasheet value: inflated to cover unmodelled error sources.
- * The others are the ADIS16448 datasheet densities. */
+/* SIG_A is not the datasheet value: inflated to cover unmodelled error sources. */
 #define SIG_A   1.0000e-2
 #define SIG_G   1.6968e-4
 #define SIG_BA  3.0000e-3
@@ -25,6 +24,7 @@ typedef struct {
         vector_3d_t ba, bg;
         clone_t clones[MAX_CLONES];
         int n_clones;
+        double max_span;   /* clone-window duration cap [s]; 0 = count-capped only */
         mat_t P;
 } eskf_t;
 

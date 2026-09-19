@@ -167,8 +167,7 @@ int main(void) {
         for (int i = 0; i < 6; i++) bad[i] = obs[i];
         bad[2].x += 0.1;
 
-        /* One outlier in six: accepted and down-weighted, so it must move P less
-         * than the same update with clean observations. */
+        /* One outlier in six: accepted but down-weighted, so it must move P less. */
         eskf_t fc = f;
         double w = 1.0;
         ret = msckf_update_track(&f, ci, bad, 6, sigma, &w);

@@ -1,3 +1,4 @@
+#include <math.h>
 #include "frontend.h"
 #include "fast.h"
 #include "cam.h"
@@ -72,9 +73,15 @@ void frontend_process(frontend_t *fe, const image_t *frame) {
                 klt_track(frame, &fe->prev, p1, pb, stb, fe->n, WIN, LEVELS);
 
                 int m = 0;
+                fe->n_in = fe->n;
+                double fbsum = 0.0, dsum = 0.0;
+                int nfb = 0, ndsp = 0;
                 for (int i = 0; i < fe->n; i++) {
                         double ex = pb[i].x - p0[i].x, ey = pb[i].y - p0[i].y;
                         if (st[i] && stb[i] && ex*ex + ey*ey < FB_MAX*FB_MAX) {
+                                double gx = p1[i].x - p0[i].x, gy = p1[i].y - p0[i].y;
+                                fbsum += ex*ex + ey*ey;  nfb++;
+                                dsum  += sqrt(gx*gx + gy*gy);  ndsp++;
                                 fe->f[m] = fe->f[i];
                                 fe->f[m].pt = p1[i];
                                 fe->f[m].age++;
@@ -91,6 +98,8 @@ void frontend_process(frontend_t *fe, const image_t *frame) {
                         }
                 }
                 fe->n = m;
+                fe->fb_rms = (nfb  > 0) ? sqrt(fbsum / nfb) : 0.0;
+                fe->disp   = (ndsp > 0) ? dsum / ndsp : 0.0;
         }
 
         if (fe->n < TARGET)
