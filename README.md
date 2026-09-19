@@ -4,7 +4,7 @@
 + Lucas-Kanade tracking and a pinhole + radial-tangential camera model. IMU and one camera
 only; no external input after the initial state.
 
-EuRoC Machine Hall, shipped configuration: **ATE 0.384 m on MH_01**, and **0.22–0.96 m across
+EuRoC Machine Hall, shipped configuration: **ATE 0.376 m on MH_01**, and **0.22–0.96 m across
 MH_01–05 with no per-sequence tuning**. Dead reckoning alone drifts 3808 m on the same sequence.
 
 Built from scratch as a learning vehicle. Not competitive with mature systems: OpenVINS-class
@@ -13,8 +13,11 @@ measured here, since no reference implementation has been run.
 
 ## Results
 
-MH_01, 183 s, initialised from ground truth at t0 only. `ATE` is the RMS position error over
-the whole run. `ratio` is ‖error‖ / √tr(P_pos): 1.0 means the covariance tells the truth.
+MH_01, initialised from ground truth at t0 only. Ground truth ends 181.9 s into the run while the
+sensors continue for another 1.07 s, so every figure below is scored over **0–181.9 s** and the 22
+camera frames past that are dropped — scoring them compares the estimate against a frozen
+reference. `ATE` is the RMS position error over that window. `ratio` is ‖error‖ / √tr(P_pos):
+1.0 means the covariance tells the truth.
 
 | t [s] | pos err [m] | predicted 1σ [m] | ratio |
 |---|---|---|---|
@@ -26,17 +29,18 @@ the whole run. `ratio` is ‖error‖ / √tr(P_pos): 1.0 means the covariance t
 | 100–120 | 0.25 | 0.090 | 2.8 |
 | 120–140 | 0.19 | 0.102 | 1.9 |
 | 140–160 | 0.43 | 0.120 | 3.5 |
-| 160–180 | 0.86 | 0.144 | 6.0 |
-| 180–183 | 1.13 | 0.155 | 7.3 |
+| 160–180 | 0.87 | 0.144 | 6.0 |
+| 180–181.9 | 1.13 | 0.155 | 7.3 |
 
-ATE **0.384 m**, peak 1.179 m, final 1.1 m. 62 848 tracks accepted, 254 rejected (0.4%).
+ATE **0.376 m**, peak 1.181 m, final 1.2 m at t = 181.9 s. 62 407 tracks accepted, 233 rejected
+(0.4%).
 
 **Breadth.** All five Machine Hall sequences, full rate, no parameter change and no tuning:
 
 | sequence | ATE [m] | peak [m] | rejected |
 |---|---|---|---|
-| MH_01_easy | 0.384 | 1.179 | 254 |
-| MH_02_easy | **0.222** | 0.526 | 281 |
+| MH_01_easy | 0.376 | 1.181 | 233 |
+| MH_02_easy | **0.220** | 0.526 | 281 |
 | MH_03_medium | 0.378 | 0.736 | 55 |
 | MH_04_difficult | 0.559 | 1.062 | 519 |
 | MH_05_difficult | 0.964 | 1.530 | 615 |
@@ -46,7 +50,7 @@ have. It is one scene family, though: the Vicon Room sequences are not in this s
 
 **Consistency.** The filter is **1.9–7.3× overconfident** on position, best in the middle of the
 run. The measurement noise model, however, is calibrated: the innovation statistic
-`gamma/dof` = 0.81 against the 1.0 that a correct `R` predicts, so `R` is right to within 20%
+`gamma/dof` = 0.79 against the 1.0 that a correct `R` predicts, so `R` is right to within 21%
 and the defect is in how `P` contracts. Two things localise it further. The ratio falls when the
 vision rate falls — 4.46 → 2.61 halving 20 → 10 Hz at constant observations per frame — which is
 the signature of **time-correlated measurement error**: `R` is diagonal while the tracker's
@@ -58,13 +62,13 @@ is not fixable with a scalar and has no fix in the tree yet.
 
 **Vision rate.** Decimating the camera has a **minimum at 10 Hz**, not at full rate:
 
-| rate | frames | ATE [m] | peak [m] | CPU vs real time |
+| rate | frames | ATE [m] | peak [m] | CPU vs real time (one session) |
 |---|---|---|---|---|
-| 20 Hz | 3660 | 0.384 | 1.179 | 4.42× |
-| **10 Hz** | 1476 | **0.239** | **0.615** | **2.57×** |
-| 5 Hz | 915 | 0.707 | 1.395 | 1.25× |
-| 3.33 Hz | 610 | 1.188 | 2.986 | — |
-| 2 Hz | 366 | 11.44 | 30.67 | 0.51× |
+| 20 Hz | 3660 | 0.376 | 1.181 | 4.42× |
+| **10 Hz** | 1830 | **0.236** | **0.615** | **2.57×** |
+| 5 Hz | 915 | 0.706 | 1.395 | 1.25× |
+| 3.33 Hz | 610 | 1.184 | 2.986 | — |
+| 2 Hz | 366 | 11.41 | 30.67 | 0.51× |
 
 Halving the rate buys 1.6× accuracy *and* 1.7× less CPU. The obvious confound — a fixed
 clone-window spans more time at lower rates, which enlarges the baseline and improves depth
@@ -80,7 +84,7 @@ Displacement is the signal that can, and unlike the error it needs no ground tru
 - **INS**, strapdown dead-reckoning: `gyro_to_q` (small-angle guard), accel to world frame, double integration
 - **ESKF**, 15-state error propagation (pos, vel, att, ba, bg). Discrete error-state transition per Solà, exact per-tick rotation on the δθ diagonal, Q from the ADIS16448 noise densities published in `eskf.h`. Clone augmentation (6-dim P extension per pose), marginalization of the oldest clone
 - **MSCKF**, Mourikis & Roumeliotis: linear multi-view triangulation with a cheirality reflection, per-observation Jacobians, null-space projection of the feature state (Gram-Schmidt), Cholesky solve, Huber robust reweight in place of a binary χ² gate
-- **Zero-velocity update**, gated on sustained absence of linear acceleration — the counter to the scale degeneracy below
+- **Degeneracy responses**: a zero-velocity update gated on sustained absence of linear acceleration (shipped), and a no-parallax covariance inflation that is measured, falsified and off by default — see the scale degeneracy below
 - **VIO front-end**, FAST-9 + NMS + grid selection (~10k raw → 231 spread corners), pyramidal KLT, forward-backward gating, persistent feature IDs, dead-track management for MSCKF (max 12 obs per track), track-length and displacement diagnostics
 - **Camera model**, pinhole + radial-tangential distortion, EuRoC cam0 calibration as compile-time constants, T_BS extrinsics
 
@@ -98,12 +102,25 @@ estimated and never stored.
 **The scale degeneracy.** For about 24 s of the MH_01 run the platform is translation-free
 while still rotating, and the camera baseline over the clone window collapses by a factor of
 1000 (0.220 m → 0.00023 m). With no parallax there is no metric scale and no depth to observe,
-so the position error grows to 9.75 m and the covariance cannot know. No residual warns of it —
-the filter is legitimately consistent throughout, `gamma/dof` ≈ 0.001. A zero-velocity update
+and nothing warns of it — no residual can, since the filter is legitimately consistent
+throughout, `gamma/dof` per frame ≈ 0.001. Under the shipped noise set, with no response
+enabled, the episode costs up to **1.23 m** of position error and a 0.259 m ATE over the first
+60 s. A zero-velocity update
 detects the stationary stretch from the accelerometer (`| ‖a‖ − g | < 0.2 m/s²` sustained 1 s,
-a detector that never fires before t = 18 s on MH_01) and holds velocity to zero: the episode's
-peak falls **9.75 → 0.26 m** and its ratio **7.36 → 2.40**. See the limits below — the premise
-is not free.
+a detector that never fires before t = 18 s on MH_01) and holds velocity to zero: the window's
+peak error falls **1.23 → 0.072 m** and the 60 s ATE **0.259 → 0.065 m**. See the limits below —
+the premise is a scenario property.
+
+**Inflating the covariance does not work.** Below a set parallax threshold the translation block
+takes the acceleration uncertainty no measurement constrains (`base_ref`, `sigma_d`); the window's
+consistency ratio is **3.00** without it and **2.77 / 3.12 / 3.80** at σ_d = 0.02 / 0.05 / 0.20,
+so no strength improves the number it exists to fix. Every camera update re-shrinks `P`, and a
+larger `P` only raises the gain, so the injected covariance is spent on the next frame and the
+estimate takes on more of the measurement's correlated error. σ_d = 0.20 lowers the window peak
+1.230 → 0.485 m and the 60 s ATE 0.259 → 0.175 m, and degrades what follows: 0.170 → 0.222 m and
+1.47 → 3.34 in ratio. With the shipped zero-velocity update on, both error and ratio get worse
+(peak 0.072 → 0.080 m, window ratio 3.07 → 4.28). The function stays in the tree with `base_ref`
+and `sigma_d` at 0, and the six configurations are recorded beside it.
 
 ## Building and running
 
@@ -126,14 +143,15 @@ command line, positionally:
 
 | arg | default | meaning |
 |---|---|---|
-| `out.csv` | `diag.csv` | one row per camera frame; `sigma_1d`, `ratio_1d`, `ratio_3d`, `att_err_deg`, `n_clones`, `ok`, `rej`, `base`, `disp` |
-| `t_end` | 0 (all) | stop after this many seconds of flight |
+| `out.csv` | `diag.csv` | one row per camera frame; `sigma_1d`, `ratio_1d`, `ratio_3d`, `att_err_deg`, `tilt_deg`, `yaw_deg`, `n_clones`, `ok`, `rej`, `base`, `disp` |
+| `t_end` | 0 (all) | stop after this many seconds of flight; clamped to the reference extent, so the default scores everything ground truth covers |
 | `sigma_px` | **0.65** | measurement noise in pixels; the shipped value is the fixed point of the NIS calibration rule |
 | `grav_gate`, `grav_sigma` | 0, 0.5 | accelerometer-as-gravity update. Measured to degrade the estimate in six configurations — kept, off by default |
 | `zupt_sigma` | **0.05** | zero-velocity update, m/s. On by default |
 | `hold_sigma` | 0 | velocity-hold variant; the assumption-free alternative to the ZUPT |
 | `decim` | 1 | keep every n-th camera frame |
 | `max_span` | 0 | clone-window duration cap [s]; 0 caps by count only |
+| `base_ref`, `sigma_d` | 0, 0 | no-parallax covariance inflation, m and m/s². Measured not to improve consistency at any strength — kept, off by default |
 
 ## Verification
 
@@ -144,11 +162,13 @@ command line, positionally:
 ## Honest limits
 
 **The zero-velocity update assumes the vehicle stops, and a drone in cruise does not.** The
-accelerometer measures Δv = 0 — velocity *constant*, not zero. The assumption-free variant
-holds velocity at its value at the start of the quiet stretch and reaches only 6.88 m against
-the ZUPT's 0.31 m, so the stationary premise is what buys the result. It improves this benchmark
-by more than it would improve a real flight profile, and on a platform that never stops it will
-not fire.
+accelerometer measures Δv = 0 — velocity *constant*, not zero, and the filter's velocity at that
+moment is not zero either. The variant that avoids the assumption, holding velocity at the value
+it had when the quiet stretch began, is **worse than doing nothing** under the shipped noise set:
+window peak 1.230 → **1.638 m** and window ratio 3.00 → **12.06**, because it freezes a velocity
+that is itself wrong and then shrinks the covariance around it. It improves this benchmark by
+more than it would improve a real flight profile, and on a platform that never stops it will not
+fire.
 
 **One scene family.** All five sequences are the same machine hall, camera, lighting and motion
 style. The Vicon Room is the genuinely different regime and is not measured.
@@ -158,19 +178,37 @@ metric, is not computed. No reference implementation has been run on these seque
 the distance to OpenVINS or VINS-Mono is not measured. Running one is the only way an accuracy
 claim means anything against the field.
 
-**The attitude error grows late and has no owner.** The non-yaw tilt — the component that leaks
-gravity into the horizontal plane — stays small through the middle of the run (0.2–0.4°) and
-then rises steadily from t ≈ 100 s, reaching a run maximum of **12.9°** over the last 20 s
-(13.4° for the combined rotation error). A 12.9° tilt is **2.2 m/s²** of spurious horizontal
-acceleration, which is the right order for the position error's growth over the same stretch.
-The growth rate matches the residual y-gyro-bias error integrating with nothing observing it.
-It is a second defect rather than the mechanism behind the consistency ratio, and nothing in
-the tree addresses it.
+**The late attitude error is yaw about gravity.** An earlier version of this page reported a
+12.9° non-yaw tilt worth 2.2 m/s² of spurious horizontal acceleration. The number was wrong twice.
+The diagnostic behind it measured the angle between
+the filter's and the truth's **body-z** axes, which is a tilt only if body z is the vertical one:
+in EuRoC the accelerometer at rest puts the near-vertical body axis in **x** (`+0.963, −0.054,
+−0.264`), leaving body z 105–114° from gravity. A near-horizontal axis is swept almost entirely by
+rotation *about* gravity, so the metric was tracking yaw. And the reference stream ends 1.07 s
+before the sensors, so the last 22 frames were scored against a frozen sample — which is where the
+largest values came from. A third defect sat under both: EuRoC's reference quaternions are not unit
+norm (80% exceed 1, by up to 6.8e-5), so a quaternion dot product passed 1, a `nan` guard caught
+it, and every error below 0.4–1.3° read as exactly 0.0000. The loader now normalises them.
 
-**Compute is the port blocker, and a separate axis from accuracy.** The update path is 72% of a
-4.42× real-time run. Two mechanical defects dominate it: `mat_t` is 51 200 bytes and every
-operation passes it by value, and one update step pays 57% of its cost for an algebraic form
-that is identical at 5× less. Never move a cost change and an accuracy change together.
+Split at the gravity axis, over the scored window:
+
+| | mean | max |
+|---|---|---|
+| tilt (perpendicular to gravity) | 0.28° | **0.64°** |
+| yaw (about gravity) | 1.94° | **7.59°** |
+| combined | 2.00° | **7.59°** |
+
+The attitude error is 97% yaw about gravity, and the spurious horizontal acceleration from tilt is
+**0.11 m/s²**, not 2.2. About two thirds of the endpoint yaw is the integrated residual gyro-bias
+error; the rest sits in the weakly observable direction, so it is the same defect as the
+consistency ratio above rather than a second one.
+
+**Compute is the port blocker, and a separate axis from accuracy.** One thread, `make run`,
+nothing else on the machine: wall 839.7 s for 181.9 s of flight, **4.62× real time**, split
+predict 28.1 s (3.3%), front-end 201.7 s (24.0%), **update 608.4 s (72.5%)** — 229 ms per frame
+with 166 ms of it the update. Two mechanical defects dominate it: `mat_t` is 51 200 bytes and
+every operation passes it by value, and one update step pays 57% of its cost for an algebraic
+form that is identical at 5× less. Never move a cost change and an accuracy change together.
 
 ## Road map
 
@@ -182,8 +220,7 @@ Open, in rough priority order: implement first-estimate Jacobians, then re-run t
 grid with and without them — closing the gap between the physically-derived settings and the
 hand-fit ones is the acceptance test; test a per-track common-mode term in `R`
 against the correlated-error hypothesis; compute RPE and run a reference implementation on the
-same sequences; extend the cross-check to triangulation; gyro-warm-started KLT to reach below
-5 Hz; and find an owner for the late attitude error.
+same sequences; extend the cross-check to triangulation; and gyro-warm-started KLT to reach below 5 Hz.
 
 Then the closed-source work: ESP32-P4 logger, a learned inertial model fused as an ordinary ESKF
 measurement, the MAVLink `ODOMETRY` wire to ArduPilot or PX4, and int8 deployment.

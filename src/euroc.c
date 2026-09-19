@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include "euroc.h"
 #include "imu.h"
 
@@ -66,6 +67,16 @@ size_t euroc_load_gt(const char *path, gt_sample_t **out) {
                         &g->gyro_bias.x,  &g->gyro_bias.y,  &g->gyro_bias.z,
                         &g->accel_bias.x, &g->accel_bias.y, &g->accel_bias.z) != 17)
                         continue;
+
+                /* EuRoC stores these up to 6.8e-5 off unit norm, 80% of samples above 1.
+                   An attitude must be unit, or a dot product passes 1 and the angle
+                   comparison clamps to zero for every small error. */
+                double qn = sqrt(g->q.w*g->q.w + g->q.x*g->q.x +
+                                 g->q.y*g->q.y + g->q.z*g->q.z);
+                if (qn > 0.0) {
+                        g->q.w /= qn;  g->q.x /= qn;
+                        g->q.y /= qn;  g->q.z /= qn;
+                }
 
                 g->timestamp = ts / 1e9;
                 i++;

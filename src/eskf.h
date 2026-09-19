@@ -35,6 +35,7 @@ void eskf_update_pos(eskf_t *f, vector_3d_t z, double sigma_z);
 int  eskf_update_gravity(eskf_t *f, vector_3d_t a_m, double gate, double sigma_a);
 int  eskf_update_zupt(eskf_t *f, double sigma_v);
 int  eskf_update_vel(eskf_t *f, vector_3d_t v_ref, double sigma_v);
+int  eskf_inflate_noparallax(eskf_t *f, double base_ref, double sigma_a, double dt);
 void eskf_augment(eskf_t *f, double timestamp);
 void eskf_inject(eskf_t *f, const mat_t *dx);
 

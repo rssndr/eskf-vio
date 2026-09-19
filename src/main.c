@@ -19,7 +19,7 @@ static size_t gt_nearest(const gt_sample_t *gt, size_t n, double t) {
         for (size_t i = 0; i < n; i++)
                 if (gt[i].timestamp >= t)
                         return i;
-        return n - 1;
+        return n;
 }
 
 /* Project P onto the four unobservable directions; the value can only grow. */
@@ -109,17 +109,6 @@ static void att_err_vec(const quaternion_t *qf, const quaternion_t *qt, double d
         dth[2] = th * (R[3] - R[1]) / s;
 }
 
-/* Angle between the two body-z axes in the world frame: tilt error leaking into gravity. */
-static double tilt_deg(const quaternion_t *qf, const quaternion_t *qt) {
-        double d = 0.0;
-        for (int k = 0; k < 3; k++)
-                d += mat_get(quat_to_R(*qf), (size_t)k, 2) *
-                     mat_get(quat_to_R(*qt), (size_t)k, 2);
-        if (d > 1.0) d = 1.0;
-        if (d < -1.0) d = -1.0;
-        return acos(d) * 180.0 / M_PI;
-}
-
 /* acos(fabs(dot)) sees dot > 1 by rounding and returns nan; clamp. */
 static double quat_ang_deg(const quaternion_t *a, const quaternion_t *b) {
         double d = fabs(a->w*b->w + a->x*b->x + a->y*b->y + a->z*b->z);
@@ -194,6 +183,10 @@ int main(int argc, char *argv[]) {
                 i0++;
 
         size_t j0 = gt_nearest(gt, m, imu[i0].timestamp);
+        if (j0 >= m) {
+                fprintf(stderr, "imu starts after the reference ends\n");
+                return 1;
+        }
 
         eskf_t f;
         eskf_init(&f, gt[j0].q, gt[j0].pos, gt[j0].vel, gt[0].accel_bias, gt[0].gyro_bias);
@@ -220,8 +213,20 @@ int main(int argc, char *argv[]) {
         double zupt_sigma = (argc >= 10) ? atof(argv[9]) : 0.05;
         /* Hold velocity at its value when the quiet stretch began; the stricter, weaker variant. */
         double hold_sigma = (argc >= 11) ? atof(argv[10]) : 0.0;
+        /* The reference stream ends before the sensors do; scoring past its last sample
+           compares against a frozen reference, so the run defaults to the reference extent. */
+        double t_gt_end = gt[m-1].timestamp - imu[i0].timestamp;
+        if (t_end <= 0.0 || t_end > t_gt_end) t_end = t_gt_end;
+        size_t n_cut = 0;
+        for (size_t i = 0; i < ncam; i++)
+                if (cam[i].timestamp - imu[i0].timestamp > t_end) n_cut++;
         vector_3d_t v_ref = { 0.0, 0.0, 0.0 };
-        int grav_ok = 0, zupt_ok = 0, hold_ok = 0, quiet_n = 0;
+        /* Parallax gate: below base_ref [m] across the clone window, inflate the
+           translation covariance at sigma_d [m/s^2]; sigma_d = 0 disables it. */
+        double base_ref = (argc >= 14) ? atof(argv[13]) : 0.0;
+        double sigma_d  = (argc >= 15) ? atof(argv[14]) : 0.0;
+        int grav_ok = 0, zupt_ok = 0, hold_ok = 0, infl_ok = 0, quiet_n = 0;
+        double t_cam_prev = imu[i0].timestamp;
         int stop = 0;
         FILE *diag = fopen(diag_path, "w");
         if (diag)
@@ -231,13 +236,15 @@ int main(int argc, char *argv[]) {
                               "r_k,r_tri,r_jac,r_null,r_chy,r_chi,iobs,vobs,nis_sum,nis_dof,"
                               "var_tx,var_ty,var_tz,var_yaw,"
                               "errx,erry,errz,verrx,verry,verrz,"
-                              "dthx,dthy,dthz,tilt_deg,asym,piv_raw,piv_sym,qw,qx,qy,qz,"
+                              "dthx,dthy,dthz,tilt_deg,yaw_deg,asym,piv_raw,piv_sym,qw,qx,qy,qz,"
                               "vprex,vprey,vprez,bax,bay,baz,bgx,bgy,bgz,svel,satt,"
                               "span,base,n_in,fb_rms,disp\n");
         else
                 fprintf(stderr, "warning: cannot open %s — diagnostics disabled\n", diag_path);
 
         printf("%-8s %-12s %-12s %-10s\n", "t [s]", "pos err [m]", "pred +- [m]", "att err [deg]");
+        printf("reference ends %.3f s into the run; scoring 0-%.3f s, %zu of %zu camera frames dropped\n\n",
+               t_gt_end, t_end, n_cut, ncam);
 
         /* Stage timing. RT frac > 1.00 means that stage alone is slower than real time. */
         double t_prop = 0.0, t_front = 0.0, t_upd = 0.0;
@@ -319,6 +326,11 @@ int main(int argc, char *argv[]) {
                                         zupt_ok++;
                                 if (quiet_n > 200 && eskf_update_vel(&f, v_ref, hold_sigma))
                                         hold_ok++;
+
+                                if (eskf_inflate_noparallax(&f, base_ref, sigma_d,
+                                                            cam[ic].timestamp - t_cam_prev))
+                                        infl_ok++;
+                                t_cam_prev = cam[ic].timestamp;
 
                                 eskf_augment(&f, cam[ic].timestamp);
                                 frontend_process(&fe, &img);
@@ -410,9 +422,12 @@ int main(int argc, char *argv[]) {
                                         double verr[3] = { f.vel.x - gd->vel.x,
                                                            f.vel.y - gd->vel.y,
                                                            f.vel.z - gd->vel.z };
-                                        double dth[3], til;
+                                        double dth[3], til, yaw;
                                         att_err_vec(&f.q, &gd->q, dth);
-                                        til = tilt_deg(&f.q, &gd->q);
+                                        /* Split the world-frame error at the gravity axis:
+                                           perpendicular leaks gravity, z is yaw about it. */
+                                        til = hypot(dth[0], dth[1]) * 180.0 / M_PI;
+                                        yaw = dth[2] * 180.0 / M_PI;
                                         double asym = p_asym(&f);
                                         double piv_raw = chol_min_pivot(&f, 0);
                                         double piv_sym = chol_min_pivot(&f, 1);
@@ -438,7 +453,7 @@ int main(int argc, char *argv[]) {
                                                 "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d,%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%d,"
                                                 "%.6e,%.6e,%.6e,%.6e,"
                                                 "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-                                                "%.6e,%.6e,%.6e,%.4f,%.6e,%.6e,%.6e,"
+                                                "%.6e,%.6e,%.6e,%.4f,%.4f,%.6e,%.6e,%.6e,"
                                                 "%.8f,%.8f,%.8f,%.8f,"
                                                 "%.6f,%.6f,%.6f,"
                                                 "%.6e,%.6e,%.6e,%.6e,%.6e,%.6e,"
@@ -467,7 +482,7 @@ int main(int argc, char *argv[]) {
                                                 ob[0], ob[1], ob[2], ob[3],
                                                 dx, dy, dz,
                                                 verr[0], verr[1], verr[2],
-                                                dth[0], dth[1], dth[2], til,
+                                                dth[0], dth[1], dth[2], til, yaw,
                                                 asym, piv_raw, piv_sym,
                                                 f.q.w, f.q.x, f.q.y, f.q.z,
                                                 vpre[0], vpre[1], vpre[2],
@@ -483,21 +498,28 @@ int main(int argc, char *argv[]) {
                 }
 
                 if ((k - i0) % 4000 == 0) {
-                        gt_sample_t *g = &gt[gt_nearest(gt, m, imu[k].timestamp)];
-                        double dx = f.pos.x - g->pos.x, dy = f.pos.y - g->pos.y, dz = f.pos.z - g->pos.z;
-                        printf("%-8.1f %-12.2f %-12.2f %-10.2f\n",
-                               imu[k].timestamp - imu[i0].timestamp,
-                               sqrt(dx*dx + dy*dy + dz*dz),
-                               sqrt(mat_get(f.P, 0, 0)),
-                               quat_ang_deg(&f.q, &g->q));
+                        size_t gi = gt_nearest(gt, m, imu[k].timestamp);
+                        if (gi < m) {
+                                gt_sample_t *g = &gt[gi];
+                                double dx = f.pos.x - g->pos.x, dy = f.pos.y - g->pos.y, dz = f.pos.z - g->pos.z;
+                                printf("%-8.1f %-12.2f %-12.2f %-10.2f\n",
+                                       imu[k].timestamp - imu[i0].timestamp,
+                                       sqrt(dx*dx + dy*dy + dz*dz),
+                                       sqrt(mat_get(f.P, 0, 0)),
+                                       quat_ang_deg(&f.q, &g->q));
+                        }
                 }
         }
 
-        gt_sample_t *g = &gt[gt_nearest(gt, m, imu[n-1].timestamp)];
+        /* At the last processed sample, not the last dataset sample: t_end separates them. */
+        size_t g_end = gt_nearest(gt, m, imu[k_last].timestamp);
+        if (g_end >= m) g_end = m - 1;
+        gt_sample_t *g = &gt[g_end];
         double dx = f.pos.x - g->pos.x, dy = f.pos.y - g->pos.y, dz = f.pos.z - g->pos.z;
-        printf("final: measured %.1f m, predicted +-%.1f m\n",
+        printf("final: measured %.1f m, predicted +-%.1f m at t = %.1f s\n",
                sqrt(dx*dx + dy*dy + dz*dz),
-               sqrt(mat_get(f.P, 0, 0)));
+               sqrt(mat_get(f.P, 0, 0)),
+               imu[k_last].timestamp - imu[i0].timestamp);
         printf("att 1-sigma: %.3f deg\n", sqrt(mat_get(f.P, 6, 6)) * 180.0 / M_PI);
         printf("updates: %d ok, %d rejected\n", updates_ok, updates_rej);
         /* gamma is chi-squared with m dof when R is right: mean 1 = calibrated, 4 = sigma^2 4x small. */
@@ -536,6 +558,8 @@ int main(int argc, char *argv[]) {
                zupt_ok, zupt_sigma);
         printf("velocity-hold update applied in %d frames (sigma %.3f m/s)\n",
                hold_ok, hold_sigma);
+        printf("no-parallax inflation applied in %d frames (base_ref %.3f m, sigma %.3f m/s^2)\n",
+               infl_ok, base_ref, sigma_d);
 
         double t_wall = now_s() - t_wall0;
         /* Span actually processed, not the dataset length - they differ under the stop option. */
@@ -552,7 +576,7 @@ int main(int argc, char *argv[]) {
                t_flight, ic, 1000.0*t_wall/(ic ? ic : 1), 1000.0*t_upd/(ic ? ic : 1));
         printf("gyro bias est %.5f %.5f %.5f | true %.5f %.5f %.5f\n",
                f.bg.x, f.bg.y, f.bg.z,
-               gt[m-1].gyro_bias.x, gt[m-1].gyro_bias.y, gt[m-1].gyro_bias.z);
+               g->gyro_bias.x, g->gyro_bias.y, g->gyro_bias.z);
 
         if (diag) fclose(diag);
         frontend_free(&fe);

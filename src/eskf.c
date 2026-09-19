@@ -275,6 +275,31 @@ int eskf_update_zupt(eskf_t *f, double sigma_v) {
         return eskf_update_vel(f, (vector_3d_t){ 0.0, 0.0, 0.0 }, sigma_v);
 }
 
+/* No parallax across the clone window leaves translation and metric scale unobserved.
+   Add the acceleration uncertainty no measurement constrains, so P stops claiming a
+   precision the camera cannot supply. Inert at or above base_ref. */
+int eskf_inflate_noparallax(eskf_t *f, double base_ref, double sigma_a, double dt) {
+        if (sigma_a <= 0.0 || base_ref <= 0.0 || f->n_clones < 2)
+                return 0;
+
+        double bx = f->clones[f->n_clones-1].pos.x - f->clones[0].pos.x;
+        double by = f->clones[f->n_clones-1].pos.y - f->clones[0].pos.y;
+        double bz = f->clones[f->n_clones-1].pos.z - f->clones[0].pos.z;
+        double g = 1.0 - sqrt(bx*bx + by*by + bz*bz) / base_ref;
+        if (g <= 0.0)
+                return 0;
+
+        double s = sigma_a * g, dv = s * dt, dp = 0.5 * s * dt * dt;
+        size_t st = f->P.cols;
+        for (size_t i = 0; i < 3; i++) {
+                size_t p = POS + i, v = VEL + i;
+                f->P.d[p*st+p] += dp*dp;
+                f->P.d[p*st+v] += dp*dv;  f->P.d[v*st+p] += dp*dv;
+                f->P.d[v*st+v] += dv*dv;
+        }
+        return 1;
+}
+
 void eskf_update_pos(eskf_t *f, vector_3d_t z, double sigma_z) {
         size_t n = 15 + 6 * (size_t)f->n_clones;
 
