@@ -11,6 +11,8 @@ Built from scratch as a learning vehicle. Not competitive with mature systems: O
 filters are more accurate on these sequences — though that is the literature's claim and is not
 measured here, since no reference implementation has been run.
 
+More details on my website: [rssndr.com](https://rssndr.com/projects/eskf-vio)
+
 ## Results
 
 MH_01, initialised from ground truth at t0 only. Ground truth ends 181.9 s into the run while the
